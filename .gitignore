@@ -1,0 +1,26 @@
+# 🔐 Environment variables
+.env
+
+# 🗂 Node modules (don't upload all dependencies)
+node_modules/
+
+# ⚙️ Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 🧪 Coverage (for tests if added later)
+coverage/
+
+# ⚙️ OS-specific
+.DS_Store
+Thumbs.db
+
+# 🚀 VSCode settings (optional, if not shared across team)
+.vscode/
+
+# 🔄 Output or build artifacts (if ever added)
+dist/
+build/
