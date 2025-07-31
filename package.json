@@ -13,6 +13,7 @@
     "cors": "^2.8.5",
     "dotenv": "16.0",
     "express": "^5.1.0",
-    "mongodb": "4.13"
+    "mongodb": "4.13",
+    "multer": "^2.0.2"
   }
 }
