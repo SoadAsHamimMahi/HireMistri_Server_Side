@@ -259,7 +259,7 @@ async function startServer() {
     });
 
 
- 
+
 
     // ===== JOBS =====
     app.get('/api/jobs', async (_req, res) => {
@@ -313,14 +313,153 @@ async function startServer() {
       }
     });
 
-    app.post('/api/applications', async (req, res) => {
-      try {
-        const result = await applicationsCollection.insertOne(req.body);
-        res.status(201).json({ message: 'Application submitted', appId: result.insertedId });
-      } catch (err) {
-        res.status(500).json({ error: 'Failed to submit application' });
+
+
+    // Good defaults for proposals/applications
+  // ===== APPLICATIONS =====
+// helpful indexes
+await applicationsCollection.createIndex({ jobId: 1 });
+await applicationsCollection.createIndex({ workerId: 1 });
+await applicationsCollection.createIndex({ clientId: 1 });
+await applicationsCollection.createIndex({ workerEmail: 1 });
+await applicationsCollection.createIndex({ clientEmail: 1 });
+// prevent duplicate apply by the same worker to the same job
+await applicationsCollection.createIndex(
+  { jobId: 1, workerId: 1 },
+  { unique: true, sparse: true }
+);
+
+// List all (debug)
+app.get('/api/applications', async (_req, res) => {
+  try {
+    const apps = await applicationsCollection.find().toArray();
+    res.json(apps);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch applications' });
+  }
+});
+
+// List a worker's applications
+app.get('/api/applications/:workerId', async (req, res) => {
+  const { workerId } = req.params;
+  try {
+    const apps = await applicationsCollection
+      .find({ workerId: String(workerId || '').trim() })
+      .toArray();
+    res.json(apps);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch applications' });
+  }
+});
+
+// Create/update a proposal (one per worker per job)
+// Create/update a proposal (one per worker per job)
+app.post('/api/applications', async (req, res) => {
+  try {
+    const b = req.body || {};
+
+    const jobId    = String(b.jobId || '').trim();
+    const workerId = String(b.workerId || '').trim();
+
+    if (!jobId || !workerId) {
+      return res.status(400).json({ error: 'jobId and workerId are required' });
+    }
+
+    // Worker info (sent from frontend WorkerJobDetails.jsx)
+    let workerEmail = b.workerEmail
+      ? String(b.workerEmail).toLowerCase().trim()
+      : (b.postedByEmail ? String(b.postedByEmail).toLowerCase().trim() : '');
+    let workerName  = b.workerName ? String(b.workerName).trim() : '';
+    let workerPhone = b.workerPhone ? String(b.workerPhone).trim() : '';
+
+    // Client (job owner) info
+    let clientId    = b.clientId ? String(b.clientId).trim() : '';
+    let clientEmail = b.clientEmail ? String(b.clientEmail).toLowerCase().trim() : '';
+
+    // Fill missing client info from job doc
+    if (ObjectId.isValid(jobId) && (!clientId || !clientEmail)) {
+      const _id = new ObjectId(jobId);
+      const j =
+        (await browseJobsCollection.findOne({ _id })) ||
+        (await jobsCollection.findOne({ _id }));
+      if (j) {
+        if (!clientId) clientId = String(j.clientId || j.postedByUid || '');
+        if (!clientEmail) {
+          const derived = j.postedByEmail || j.email || '';
+          clientEmail = derived ? String(derived).toLowerCase().trim() : '';
+        }
       }
-    });
+    }
+
+    const now = new Date();
+    const proposalText = String(b.proposalText || b.text || '').trim();
+
+    const update = {
+      $set: {
+        jobId,
+        workerId,
+
+        // job owner
+        clientId: clientId || null,
+        clientEmail: clientEmail || null,
+
+        // worker info
+        workerEmail: workerEmail || null,
+        workerName: workerName || null,
+        workerPhone: workerPhone || null,
+
+        // keep for backward compatibility
+        postedByEmail: workerEmail || null,
+
+        proposalText,
+        status: b.status ? String(b.status) : 'pending',
+        updatedAt: now,
+      },
+      $setOnInsert: { createdAt: now },
+    };
+
+    const result = await applicationsCollection.updateOne(
+      { jobId, workerId }, // unique pair
+      update,
+      { upsert: true }
+    );
+
+    const doc = await applicationsCollection.findOne({ jobId, workerId });
+    res.status(result.upsertedId ? 201 : 200).json({ ok: true, application: doc });
+  } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: 'You already applied to this job.' });
+    }
+    console.error('POST /api/applications failed:', err);
+    res.status(500).json({ error: 'Failed to submit proposal' });
+  }
+});
+
+
+// All proposals for a job (for client side)
+app.get('/api/job-applications/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const apps = await applicationsCollection
+      .find({ jobId: String(jobId) })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(apps);
+  } catch (err) {
+    console.error('GET /api/job-applications/:jobId failed:', err);
+    res.status(500).json({ error: 'Failed to fetch proposals' });
+  }
+});
+
+
+    // app.post('/api/applications', async (req, res) => {
+    //   try {
+    //     const result = await applicationsCollection.insertOne(req.body);
+    //     res.status(201).json({ message: 'Application submitted', appId: result.insertedId });
+    //   } catch (err) {
+    //     res.status(500).json({ error: 'Failed to submit application' });
+    //   }
+    // });
 
     // ===== BROWSE JOBS =====
     app.get('/api/browse-jobs', async (req, res) => {
