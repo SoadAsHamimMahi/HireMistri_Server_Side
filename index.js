@@ -127,127 +127,200 @@ async function startServer() {
     // });
 
     // ---- Edit worker Profile (users) ----
-
-    // Indexes (safe to call multiple times)
+    // ---------- indexes ----------
     await usersCollection.createIndex({ uid: 1 }, { unique: true, sparse: true });
     await usersCollection.createIndex({ email: 1 }, { unique: true, sparse: true });
-    await usersCollection.createIndex({ roles: 1 }, { sparse: true });
 
-    // helper to sanitize/whitelist incoming fields
-    function sanitizeWorkerPayload(body = {}) {
-      const w = (body.profiles && body.profiles.worker) ? body.profiles.worker : body;
-
-      const str = (v, d = "") => (typeof v === "string" ? v.trim() : d);
-      const num = (v, d = 0) => {
-        const n = Number(v);
-        return Number.isFinite(n) ? n : d;
-      };
-
-      const worker = {
-        firstName: str(w.firstName),
-        lastName: str(w.lastName),
-        displayName: str(w.displayName),
-        phone: str(w.phone),
-        workExperience: num(w.workExperience),
-        headline: str(w.headline),
-        bio: str(w.bio),
-        skills: Array.isArray(w.skills) ? w.skills.map((s) => String(s).trim()).filter(Boolean) : [],
-        isAvailable: Boolean(w.isAvailable ?? true),
-        avatar: str(w.avatar || w.profileCover || ""),
-        address1: str(w.address1),
-        address2: str(w.address2),
-        location: {
-          city: str(w.location?.city || body.city),
-          country: str(w.location?.country || body.country || "Bangladesh"),
-          zip: str(w.location?.zip || body.zip),
-        },
-      };
-
-      // prune empty strings/empty objects
-      (function prune(obj) {
-        Object.keys(obj).forEach((k) => {
-          const v = obj[k];
-          if (v && typeof v === "object" && !Array.isArray(v)) prune(v);
-          const isEmptyObj = v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 0;
-          if (v === "" || isEmptyObj) delete obj[k];
-        });
-      })(worker);
-
-      return worker;
+    // ---------- helpers ----------
+    function pruneEmpty(obj) {
+      Object.keys(obj).forEach((k) => {
+        const v = obj[k];
+        if (v && typeof v === 'object' && !Array.isArray(v)) pruneEmpty(v);
+        const isEmptyObj = v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0;
+        if (v === '' || v === undefined || isEmptyObj) delete obj[k];
+      });
+      return obj;
     }
 
-    // PUT upsert worker profile under profiles.worker
-    app.put('/api/users/:uid', async (req, res) => {
-      try {
-        console.log('PUT /api/users/:uid (flat) → uid:', req.params.uid);
-        const uid = String(req.params.uid || '').trim();
-        if (!uid) return res.status(400).json({ error: 'Missing uid in URL' });
+    // build a $set from only allowed keys that are present on req.body
+    function buildUserSet(body = {}) {
+      const allowed = [
+        'firstName', 'lastName', 'displayName', 'phone', 'headline', 'bio',
+        'skills', 'isAvailable', 'profileCover', 'address1', 'address2',
+        'city', 'country', 'zip', 'workExperience', 'role'
+      ];
 
-        const b = req.body || {};
-        const now = new Date();
-
-        const email = String(b.email || '').toLowerCase().trim();
-
-        // Normalize inputs from your EditProfile.jsx
-        const setDoc = {
-          uid,
-          // core
-          displayName: (b.displayName || '').trim(),
-          firstName: (b.firstName || '').trim(),
-          lastName: (b.lastName || '').trim(),
-          phone: (b.phone || '').trim(),
-          role: (b.role || 'worker').toLowerCase(),
-
-          // profile extras
-          headline: (b.headline || '').trim(),
-          bio: (b.bio || '').trim(),
-          workExperience: Number(b.workExperience) || 0,
-          isAvailable: !!b.isAvailable,
-          skills: Array.isArray(b.skills) ? b.skills.map(s => String(s).trim()).filter(Boolean) : [],
-          profileCover: b.profileCover || null,
-
-          // address (your UI uses flat keys)
-          address1: (b.address1 || '').trim(),
-          address2: (b.address2 || '').trim(),
-          city: (b.city || '').trim(),
-          country: (b.country || 'Bangladesh').trim(),
-          zip: (b.zip || '').trim(),
-
-          updatedAt: now,
-        };
-
-        // only set email if non-empty; otherwise unset to avoid unique "" collisions
-        const update = {
-          $set: setDoc,
-          $setOnInsert: { createdAt: now },
-        };
-        if (email) update.$set.email = email; else update.$unset = { email: "" };
-
-        const result = await usersCollection.updateOne({ uid }, update, { upsert: true });
-        console.log('Mongo result:', { matched: result.matchedCount, modified: result.modifiedCount, upsertedId: result.upsertedId });
-
-        const doc = await usersCollection.findOne({ uid });
-        return res.json({ ok: true, user: doc });
-      } catch (err) {
-        console.error('PUT /api/users/:uid failed:', err);
-        if (err && err.code === 11000) {
-          return res.status(409).json({ error: 'Duplicate key (likely email). Use a unique email.' });
+      const set = {};
+      for (const k of allowed) {
+        if (Object.prototype.hasOwnProperty.call(body, k)) {
+          set[k] = body[k];
         }
-        return res.status(500).json({ error: 'Failed to upsert user' });
+      }
+
+      // normalize
+      if (Array.isArray(set.skills)) {
+        set.skills = set.skills.map(s => String(s).trim()).filter(Boolean);
+      }
+      if (Object.prototype.hasOwnProperty.call(set, 'isAvailable')) {
+        set.isAvailable = !!set.isAvailable;
+      }
+      if (Object.prototype.hasOwnProperty.call(set, 'workExperience')) {
+        const n = Number(set.workExperience);
+        set.workExperience = Number.isFinite(n) ? n : 0;
+      }
+
+      return pruneEmpty(set);
+    }
+
+    // ---------- routes ----------
+
+    // GET a user
+    app.get('/api/users/:uid', async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const doc = await usersCollection.findOne({ uid });
+        if (!doc) return res.status(404).json({ error: 'User not found' });
+        res.json(doc);
+      } catch (err) {
+        console.error('GET /api/users/:uid failed:', err);
+        res.status(500).json({ error: 'Failed to fetch user' });
       }
     });
 
-    // Upload avatar and persist directly to profiles.worker.avatar
+    // PATCH (non-destructive upsert)
+    // ---------- SAFE UPDATE (non-destructive) ----------
+    app.patch('/api/users/:uid', async (req, res) => {
+      try {
+        const uid = String(req.params.uid || '').trim();
+        if (!uid) return res.status(400).json({ error: 'Missing uid' });
+
+        const now = new Date();
+        const body = req.body || {};
+        const allowUnset = String(req.query.allowUnset || '').toLowerCase() === 'true';
+
+        // whitelist keys we allow to update
+        const allowed = new Set([
+          'firstName', 'lastName', 'displayName', 'phone', 'headline', 'bio',
+          'skills', 'isAvailable', 'profileCover', 'address1', 'address2',
+          'city', 'country', 'zip', 'workExperience', 'role', 'email'
+        ]);
+
+        // current doc for comparison (prevents wipe)
+        const existing = await usersCollection.findOne({ uid }) || { uid, createdAt: now };
+
+        const $set = {};
+        const $unset = {};
+
+        // merge only provided & non-empty values
+        for (const [k, vRaw] of Object.entries(body)) {
+          if (!allowed.has(k)) continue;
+
+          // email normalization
+          const v = (k === 'email' && typeof vRaw === 'string')
+            ? vRaw.toLowerCase().trim()
+            : vRaw;
+
+          // arrays: keep only truthy strings
+          if (k === 'skills' && Array.isArray(v)) {
+            const cleaned = v.map(s => String(s).trim()).filter(Boolean);
+            if (cleaned.length) $set[k] = cleaned;
+            continue;
+          }
+
+          // booleans/numbers are OK as is
+          if (typeof v === 'boolean' || typeof v === 'number') {
+            $set[k] = v;
+            continue;
+          }
+
+          // strings: skip empty (prevents erasing good data)
+          if (typeof v === 'string') {
+            const t = v.trim();
+            if (t) $set[k] = t;
+            else if (allowUnset && t === '' && existing[k] !== undefined) $unset[k] = '';
+            continue;
+          }
+
+          // null -> unset only if explicitly allowed
+          if (v === null) {
+            if (allowUnset && existing[k] !== undefined) $unset[k] = '';
+            continue;
+          }
+
+          // other objects (e.g. profileCover already string URL) — set if not empty object
+          if (v && typeof v === 'object') {
+            if (Object.keys(v).length) $set[k] = v;
+          }
+        }
+
+        // Always update updatedAt
+        $set.updatedAt = now;
+
+        const updateDoc = { $set, $setOnInsert: { uid, createdAt: existing.createdAt || now } };
+        if (Object.keys($unset).length) updateDoc.$unset = $unset;
+
+        // If nothing to change, just return the current doc
+        if (Object.keys($set).length === 1 && Object.keys($unset).length === 0) { // only updatedAt present
+          return res.json(existing);
+        }
+
+        await usersCollection.updateOne({ uid }, updateDoc, { upsert: true });
+        const doc = await usersCollection.findOne({ uid });
+        return res.json(doc);
+      } catch (err) {
+        console.error('PATCH /api/users/:uid failed:', err);
+        if (err?.code === 11000) {
+          return res.status(409).json({ error: 'Duplicate key (email must be unique)' });
+        }
+        return res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // Keep PUT for old clients but route it through PATCH logic
+    app.put('/api/users/:uid', (req, res, next) => {
+      req.method = 'PATCH';
+      next();
+    });
+
+
+    // First-login sync: only create if missing (no destructive $set)
+    app.post('/api/auth/sync', async (req, res) => {
+      try {
+        const { uid, email } = req.body || {};
+        if (!uid) return res.status(400).json({ error: 'uid required' });
+
+        await usersCollection.updateOne(
+          { uid: String(uid) },
+          {
+            $setOnInsert: {
+              uid: String(uid),
+              createdAt: new Date(),
+              role: 'worker',
+              ...(email ? { email: String(email).toLowerCase().trim() } : {})
+            }
+          },
+          { upsert: true }
+        );
+
+        const doc = await usersCollection.findOne({ uid: String(uid) });
+        res.json(doc);
+      } catch (e) {
+        console.error('POST /api/auth/sync failed:', e);
+        res.status(500).json({ error: 'sync failed' });
+      }
+    });
+
+
+    // Avatar upload (kept, minor tidy)
     app.post('/api/users/:uid/avatar', upload.single('avatar'), async (req, res) => {
       try {
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
         const uid = String(req.params.uid);
         const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-        const now = new Date();
 
         await usersCollection.updateOne(
           { uid },
-          { $set: { profileCover: publicUrl, updatedAt: now }, $setOnInsert: { uid, createdAt: now } },
+          { $set: { profileCover: publicUrl, updatedAt: new Date() }, $setOnInsert: { uid, createdAt: new Date() } },
           { upsert: true }
         );
 
@@ -316,140 +389,265 @@ async function startServer() {
 
 
     // Good defaults for proposals/applications
-  // ===== APPLICATIONS =====
-// helpful indexes
-await applicationsCollection.createIndex({ jobId: 1 });
-await applicationsCollection.createIndex({ workerId: 1 });
-await applicationsCollection.createIndex({ clientId: 1 });
-await applicationsCollection.createIndex({ workerEmail: 1 });
-await applicationsCollection.createIndex({ clientEmail: 1 });
-// prevent duplicate apply by the same worker to the same job
-await applicationsCollection.createIndex(
-  { jobId: 1, workerId: 1 },
-  { unique: true, sparse: true }
-);
-
-// List all (debug)
-app.get('/api/applications', async (_req, res) => {
-  try {
-    const apps = await applicationsCollection.find().toArray();
-    res.json(apps);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch applications' });
-  }
-});
-
-// List a worker's applications
-app.get('/api/applications/:workerId', async (req, res) => {
-  const { workerId } = req.params;
-  try {
-    const apps = await applicationsCollection
-      .find({ workerId: String(workerId || '').trim() })
-      .toArray();
-    res.json(apps);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch applications' });
-  }
-});
-
-// Create/update a proposal (one per worker per job)
-// Create/update a proposal (one per worker per job)
-app.post('/api/applications', async (req, res) => {
-  try {
-    const b = req.body || {};
-
-    const jobId    = String(b.jobId || '').trim();
-    const workerId = String(b.workerId || '').trim();
-
-    if (!jobId || !workerId) {
-      return res.status(400).json({ error: 'jobId and workerId are required' });
-    }
-
-    // Worker info (sent from frontend WorkerJobDetails.jsx)
-    let workerEmail = b.workerEmail
-      ? String(b.workerEmail).toLowerCase().trim()
-      : (b.postedByEmail ? String(b.postedByEmail).toLowerCase().trim() : '');
-    let workerName  = b.workerName ? String(b.workerName).trim() : '';
-    let workerPhone = b.workerPhone ? String(b.workerPhone).trim() : '';
-
-    // Client (job owner) info
-    let clientId    = b.clientId ? String(b.clientId).trim() : '';
-    let clientEmail = b.clientEmail ? String(b.clientEmail).toLowerCase().trim() : '';
-
-    // Fill missing client info from job doc
-    if (ObjectId.isValid(jobId) && (!clientId || !clientEmail)) {
-      const _id = new ObjectId(jobId);
-      const j =
-        (await browseJobsCollection.findOne({ _id })) ||
-        (await jobsCollection.findOne({ _id }));
-      if (j) {
-        if (!clientId) clientId = String(j.clientId || j.postedByUid || '');
-        if (!clientEmail) {
-          const derived = j.postedByEmail || j.email || '';
-          clientEmail = derived ? String(derived).toLowerCase().trim() : '';
-        }
-      }
-    }
-
-    const now = new Date();
-    const proposalText = String(b.proposalText || b.text || '').trim();
-
-    const update = {
-      $set: {
-        jobId,
-        workerId,
-
-        // job owner
-        clientId: clientId || null,
-        clientEmail: clientEmail || null,
-
-        // worker info
-        workerEmail: workerEmail || null,
-        workerName: workerName || null,
-        workerPhone: workerPhone || null,
-
-        // keep for backward compatibility
-        postedByEmail: workerEmail || null,
-
-        proposalText,
-        status: b.status ? String(b.status) : 'pending',
-        updatedAt: now,
-      },
-      $setOnInsert: { createdAt: now },
-    };
-
-    const result = await applicationsCollection.updateOne(
-      { jobId, workerId }, // unique pair
-      update,
-      { upsert: true }
+    // ===== APPLICATIONS =====
+    // helpful indexes
+    await applicationsCollection.createIndex({ jobId: 1 });
+    await applicationsCollection.createIndex({ workerId: 1 });
+    await applicationsCollection.createIndex({ clientId: 1 });
+    await applicationsCollection.createIndex({ workerEmail: 1 });
+    await applicationsCollection.createIndex({ clientEmail: 1 });
+    // prevent duplicate apply by the same worker to the same job
+    await applicationsCollection.createIndex(
+      { jobId: 1, workerId: 1 },
+      { unique: true, sparse: true }
     );
 
-    const doc = await applicationsCollection.findOne({ jobId, workerId });
-    res.status(result.upsertedId ? 201 : 200).json({ ok: true, application: doc });
-  } catch (err) {
-    if (err?.code === 11000) {
-      return res.status(409).json({ error: 'You already applied to this job.' });
+    // List all (debug)
+    app.get('/api/applications', async (_req, res) => {
+      try {
+        const apps = await applicationsCollection.find().toArray();
+        res.json(apps);
+      } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch applications' });
+      }
+    });
+
+    // List a worker's applications
+    app.get('/api/applications/:workerId', async (req, res) => {
+      const { workerId } = req.params;
+      try {
+        const apps = await applicationsCollection
+          .find({ workerId: String(workerId || '').trim() })
+          .toArray();
+        res.json(apps);
+      } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch applications' });
+      }
+    });
+
+
+    // OPTIONAL: if you have these, keep the requires near the top of your server:
+    const { ObjectId } = require('mongodb');
+    let admin; try { admin = require('firebase-admin'); } catch (_) { admin = null; }
+
+    // helper: try to fetch worker identity from usersCollection or Firebase Admin
+    async function getWorkerIdentity(workerId, { usersCollection }) {
+      const out = { email: '', name: '', phone: '' };
+
+      // 1) users collection (recommended, if you keep profiles)
+      if (usersCollection) {
+        const u = await usersCollection.findOne({ uid: workerId });
+        if (u) {
+          out.email = (u.email || out.email).toLowerCase().trim();
+          out.name = (u.name || out.name).trim();
+          out.phone = (u.phone || out.phone).trim();
+          if (out.email && out.name && out.phone) return out;
+        }
+      }
+
+      // 2) Firebase Admin (if available)
+      if (admin?.apps?.length) {
+        try {
+          const rec = await admin.auth().getUser(workerId);
+          if (rec) {
+            out.email = (rec.email || out.email).toLowerCase().trim();
+            out.name = (rec.displayName || out.name).trim();
+            out.phone = (rec.phoneNumber || out.phone).trim();
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      return out;
     }
-    console.error('POST /api/applications failed:', err);
-    res.status(500).json({ error: 'Failed to submit proposal' });
-  }
-});
+
+    // Create/update a proposal (one per worker per job)
+
+    app.post('/api/applications', async (req, res) => {
+      try {
+        const b = req.body || {};
+
+        const jobId = String(b.jobId || '').trim();
+        const workerId = String(b.workerId || '').trim();
+        if (!jobId || !workerId) {
+          return res.status(400).json({ error: 'jobId and workerId are required' });
+        }
+
+        // Cleaners
+        const str = (v) => (v == null ? '' : String(v));
+        const s = (v) => str(v).trim();
+        const mail = (v) => s(v).toLowerCase();
+
+        // Incoming (may be empty)
+        let workerEmailIn = mail(b.workerEmail || b.postedByEmail);
+        let workerNameIn = s(b.workerName);
+        let workerPhoneIn = s(b.workerPhone);
+
+        let clientIdIn = s(b.clientId);
+        let clientEmailIn = mail(b.clientEmail);
+
+        // Pull any existing application so we don't overwrite fields
+        const existing = await applicationsCollection.findOne({ jobId, workerId });
+
+        // If missing client info, derive from the job doc
+        if (ObjectId.isValid(jobId) && (!clientIdIn || !clientEmailIn)) {
+          const _id = new ObjectId(jobId);
+          const j =
+            (await browseJobsCollection.findOne({ _id })) ||
+            (await jobsCollection.findOne({ _id }));
+          if (j) {
+            if (!clientIdIn) clientIdIn = s(j.clientId || j.postedByUid);
+            if (!clientEmailIn) clientEmailIn = mail(j.postedByEmail || j.email);
+          }
+        }
+
+        // If worker identity still missing (either first insert or older rows),
+        // try to backfill from usersCollection / Firebase Admin once.
+        if ((!workerEmailIn || !workerNameIn || !workerPhoneIn) &&
+          (!existing || !existing.workerEmail || !existing.workerName || !existing.workerPhone)) {
+          const backfill = await getWorkerIdentity(workerId, { usersCollection });
+          workerEmailIn = workerEmailIn || backfill.email;
+          workerNameIn = workerNameIn || backfill.name;
+          workerPhoneIn = workerPhoneIn || backfill.phone;
+        }
+
+        const now = new Date();
+
+        // Build $set carefully: only change what we intend to change
+        const $set = {
+          updatedAt: now,
+        };
+
+        // Status if provided; default only for new docs
+        if (b.status) {
+          $set.status = s(b.status);
+        }
+
+        // Keep proposalText if request included (avoid blanking on status-only updates)
+        if ('proposalText' in b || 'text' in b) {
+          $set.proposalText = s(b.proposalText || b.text);
+        }
+
+        // Update client info if present
+        if (clientIdIn) $set.clientId = clientIdIn;
+        if (clientEmailIn) $set.clientEmail = clientEmailIn;
+
+        // Only set worker identity if provided/backfilled this time
+        if (workerEmailIn) {
+          $set.workerEmail = workerEmailIn;
+          $set.postedByEmail = workerEmailIn; // backward compat mirror
+        }
+        if (workerNameIn) $set.workerName = workerNameIn;
+        if (workerPhoneIn) $set.workerPhone = workerPhoneIn;
+
+        // For first insert
+        const $setOnInsert = {
+          jobId,
+          workerId,
+          createdAt: now,
+          status: b.status ? s(b.status) : 'pending',
+        };
+
+        if ('proposalText' in $set) $setOnInsert.proposalText = $set.proposalText;
+        if (clientIdIn) $setOnInsert.clientId = clientIdIn;
+        if (clientEmailIn) $setOnInsert.clientEmail = clientEmailIn;
+        if (workerEmailIn) { $setOnInsert.workerEmail = workerEmailIn; $setOnInsert.postedByEmail = workerEmailIn; }
+        if (workerNameIn) $setOnInsert.workerName = workerNameIn;
+        if (workerPhoneIn) $setOnInsert.workerPhone = workerPhoneIn;
+
+        const result = await applicationsCollection.updateOne(
+          { jobId, workerId },
+          { $set, $setOnInsert },
+          { upsert: true }
+        );
+
+        const doc = await applicationsCollection.findOne({ jobId, workerId });
+        res.status(result.upsertedId ? 201 : 200).json({ ok: true, application: doc });
+      } catch (err) {
+        if (err?.code === 11000) {
+          return res.status(409).json({ error: 'You already applied to this job.' });
+        }
+        console.error('POST /api/applications failed:', err);
+        res.status(500).json({ error: 'Failed to submit proposal' });
+      }
+    });
 
 
-// All proposals for a job (for client side)
-app.get('/api/job-applications/:jobId', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const apps = await applicationsCollection
-      .find({ jobId: String(jobId) })
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.json(apps);
-  } catch (err) {
-    console.error('GET /api/job-applications/:jobId failed:', err);
-    res.status(500).json({ error: 'Failed to fetch proposals' });
-  }
-});
+
+    // All proposals for a job (for client side)
+    app.get('/api/job-applications/:jobId', async (req, res) => {
+      try {
+        const { jobId } = req.params;
+        const apps = await applicationsCollection
+          .find({ jobId: String(jobId) })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json(apps);
+      } catch (err) {
+        console.error('GET /api/job-applications/:jobId failed:', err);
+        res.status(500).json({ error: 'Failed to fetch proposals' });
+      }
+    });
+
+
+    // GET /api/my-applications/:workerId  → applications with basic job info
+    app.get('/api/my-applications/:workerId', async (req, res) => {
+      try {
+        const workerId = String(req.params.workerId || '').trim();
+        if (!workerId) return res.status(400).json({ error: 'workerId required' });
+
+        const cursor = applicationsCollection.aggregate([
+          { $match: { workerId } },
+          {
+            $addFields: {
+              _jobObjId: {
+                $convert: { input: "$jobId", to: "objectId", onError: null, onNull: null }
+              }
+            }
+          },
+          {
+            $lookup: {
+              from: browseJobsCollection.collectionName, // e.g. "browseJobs"
+              localField: "_jobObjId",
+              foreignField: "_id",
+              as: "bj"
+            }
+          },
+          {
+            $lookup: {
+              from: jobsCollection.collectionName, // e.g. "jobs"
+              localField: "_jobObjId",
+              foreignField: "_id",
+              as: "j"
+            }
+          },
+          {
+            $addFields: {
+              jobDoc: { $ifNull: [{ $arrayElemAt: ["$bj", 0] }, { $arrayElemAt: ["$j", 0] }] }
+            }
+          },
+          {
+            $addFields: {
+              title: { $ifNull: ["$jobDoc.title", "$title"] },
+              location: { $ifNull: ["$jobDoc.location", "$location"] },
+              budget: { $ifNull: ["$jobDoc.budget", "$budget"] },
+              category: { $ifNull: ["$jobDoc.category", "$category"] },
+              images: { $ifNull: ["$jobDoc.images", []] }
+            }
+          },
+          { $project: { bj: 0, j: 0, jobDoc: 0, _jobObjId: 0 } },
+          { $sort: { createdAt: -1 } }
+        ]);
+
+        const docs = await cursor.toArray();
+        res.json(docs);
+      } catch (err) {
+        console.error('GET /api/my-applications/:workerId failed:', err);
+        res.status(500).json({ error: 'Failed to fetch applications' });
+      }
+    });
+
 
 
     // app.post('/api/applications', async (req, res) => {
