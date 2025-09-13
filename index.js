@@ -460,15 +460,51 @@ async function startServer() {
       }
     });
 
-    // All proposals for a job (for client side)
+    // All proposals for a job (for client side) - FIXED VERSION
     app.get('/api/job-applications/:jobId', async (req, res) => {
       try {
         const { jobId } = req.params;
+        
+        // Get applications for the job
         const apps = await applicationsCollection
           .find({ jobId: String(jobId) })
           .sort({ createdAt: -1 })
           .toArray();
-        res.json(apps);
+
+        // Enrich each application with worker details
+        const enrichedApps = await Promise.all(
+          apps.map(async (app) => {
+            let workerName = app.workerName || 'Unknown Worker';
+            let workerEmail = app.workerEmail || 'No email';
+            let workerPhone = app.workerPhone || 'No phone';
+
+            // Try to get additional worker details from users collection
+            if (app.workerId) {
+              try {
+                const worker = await usersCollection.findOne({ uid: app.workerId });
+                if (worker) {
+                  workerName = worker.displayName || 
+                              [worker.firstName, worker.lastName].filter(Boolean).join(' ') || 
+                              workerName;
+                  workerEmail = worker.email || workerEmail;
+                  workerPhone = worker.phone || workerPhone;
+                }
+              } catch (err) {
+                console.error('Failed to fetch worker details:', err);
+                // Keep the existing values
+              }
+            }
+
+            return {
+              ...app,
+              workerName,
+              workerEmail,
+              workerPhone
+            };
+          })
+        );
+
+        res.json(enrichedApps);
       } catch (err) {
         console.error('GET /api/job-applications/:jobId failed:', err);
         res.status(500).json({ error: 'Failed to fetch proposals' });
@@ -567,6 +603,9 @@ async function startServer() {
           category: a.category ?? '',
           createdAt: a.createdAt || a.updatedAt || null,
           status: (a.status || 'pending').toLowerCase(),
+          workerName: a.workerName || 'Unknown Worker',
+          workerEmail: a.workerEmail || 'No email',
+          workerPhone: a.workerPhone || 'No phone',
         }));
 
         res.json(normalized);
@@ -579,9 +618,7 @@ async function startServer() {
 
     app.get('/health', (_req, res) => res.json({ ok: true }));
 
-    app.listen(PORT, () => {
-      console.log(`API listening on http://localhost:${PORT}`);
-    });
+   
 
 
     // Update application status (accept/reject/complete, etc.)
@@ -682,8 +719,8 @@ async function startServer() {
 
     // ---------- Routes end ----------
 
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
     });
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err);
