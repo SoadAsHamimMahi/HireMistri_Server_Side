@@ -79,6 +79,7 @@ async function startServer() {
     jobsCollection = db.collection('jobs');
     applicationsCollection = db.collection('applications');
     browseJobsCollection = db.collection('browseJobs');
+    messagesCollection = db.collection('messages');
 
     // ---------- indexes ----------
     await usersCollection.createIndex({ uid: 1 }, { unique: true, sparse: true });
@@ -94,6 +95,12 @@ async function startServer() {
       { jobId: 1, workerId: 1 },
       { unique: true, sparse: true }
     );
+
+    // Messages indexes
+    await messagesCollection.createIndex({ conversationId: 1, createdAt: 1 });
+    await messagesCollection.createIndex({ senderId: 1 });
+    await messagesCollection.createIndex({ recipientId: 1 });
+    await messagesCollection.createIndex({ jobId: 1 });
 
     // ---------- helpers ----------
     function pruneEmpty(obj) {
@@ -511,6 +518,104 @@ async function startServer() {
       }
     });
 
+    // Get all applications for jobs posted by a client
+    app.get('/api/client-applications/:clientId', async (req, res) => {
+      try {
+        const clientId = req.params.clientId;
+        if (!clientId) return res.status(400).json({ error: 'Missing clientId' });
+
+        const Applications = db.collection('applications');
+        const BrowseJobs = db.collection('browseJobs');
+        const Jobs = db.collection('jobs');
+
+        // First, get all job IDs posted by this client
+        const clientJobs = await BrowseJobs.find({ clientId }).project({ _id: 1 }).toArray();
+        const clientJobIds = clientJobs.map(j => String(j._id));
+
+        if (clientJobIds.length === 0) {
+          return res.json([]);
+        }
+
+        const pipeline = [
+          { $match: { jobId: { $in: clientJobIds } } },
+          { $sort: { createdAt: -1, _id: -1 } },
+          {
+            $addFields: {
+              jobIdObj: {
+                $convert: { input: '$jobId', to: 'objectId', onError: null, onNull: null }
+              }
+            }
+          },
+          {
+            $lookup: {
+              from: BrowseJobs.collectionName,
+              let: { jIdObj: '$jobIdObj' },
+              pipeline: [
+                { $match: { $expr: { $eq: ['$_id', '$$jIdObj'] } } },
+                { $project: { title: 1, location: 1, budget: 1, category: 1, clientId: 1 } }
+              ],
+              as: 'bj'
+            }
+          },
+          {
+            $lookup: {
+              from: Jobs.collectionName,
+              let: { jIdObj: '$jobIdObj' },
+              pipeline: [
+                { $match: { $expr: { $eq: ['$_id', '$$jIdObj'] } } },
+                { $project: { title: 1, location: 1, budget: 1, category: 1 } }
+              ],
+              as: 'j'
+            }
+          },
+          {
+            $addFields: {
+              jobDoc: {
+                $cond: [
+                  { $gt: [{ $size: '$bj' }, 0] },
+                  { $first: '$bj' },
+                  { $first: '$j' }
+                ]
+              }
+            }
+          },
+          {
+            $project: {
+              _id: 1,
+              jobId: 1,
+              workerId: 1,
+              clientId: 1,
+              status: 1,
+              proposalText: 1,
+              createdAt: 1,
+              updatedAt: 1,
+              title: '$jobDoc.title',
+              location: '$jobDoc.location',
+              budget: '$jobDoc.budget',
+              category: '$jobDoc.category',
+            }
+          }
+        ];
+
+        const rows = await Applications.aggregate(pipeline).toArray();
+
+        const normalized = rows.map(a => ({
+          ...a,
+          title: a.title ?? 'Untitled Job',
+          location: a.location ?? 'N/A',
+          budget: a.budget ?? null,
+          category: a.category ?? '',
+          createdAt: a.createdAt || a.updatedAt || null,
+          status: (a.status || 'pending').toLowerCase(),
+        }));
+
+        res.json(normalized);
+      } catch (err) {
+        console.error('GET /api/client-applications error:', err);
+        res.status(500).json({ error: 'Failed to load applications' });
+      }
+    });
+
     app.get('/api/my-applications/:uid', async (req, res) => {
       try {
         const workerId = req.params.uid;
@@ -647,18 +752,118 @@ async function startServer() {
       }
     });
 
+    // Aliases for updating application status to support client fallbacks
+    // PATCH /api/applications/:id (recommended)
+    app.patch('/api/applications/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const statusIn = String(req.body?.status || '').toLowerCase().trim();
+        const allowed = new Set(['pending', 'accepted', 'rejected', 'completed']);
+
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid application id' });
+        if (!allowed.has(statusIn)) return res.status(400).json({ error: 'Invalid status' });
+
+        const _id = new ObjectId(id);
+        const upd = await applicationsCollection.updateOne(
+          { _id },
+          { $set: { status: statusIn, updatedAt: new Date() } }
+        );
+
+        if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
+
+        const doc = await applicationsCollection.findOne({ _id });
+        res.json(doc);
+      } catch (err) {
+        console.error('PATCH /api/applications/:id failed:', err);
+        res.status(500).json({ error: 'Failed to update status' });
+      }
+    });
+
+    // PUT /api/applications/:id (alias)
+    app.put('/api/applications/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const statusIn = String(req.body?.status || '').toLowerCase().trim();
+        const allowed = new Set(['pending', 'accepted', 'rejected', 'completed']);
+
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid application id' });
+        if (!allowed.has(statusIn)) return res.status(400).json({ error: 'Invalid status' });
+
+        const _id = new ObjectId(id);
+        const upd = await applicationsCollection.updateOne(
+          { _id },
+          { $set: { status: statusIn, updatedAt: new Date() } }
+        );
+
+        if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
+
+        const doc = await applicationsCollection.findOne({ _id });
+        res.json(doc);
+      } catch (err) {
+        console.error('PUT /api/applications/:id failed:', err);
+        res.status(500).json({ error: 'Failed to update status' });
+      }
+    });
+
+    // POST /api/applications/update-status (alias)
+    app.post('/api/applications/update-status', async (req, res) => {
+      try {
+        const { applicationId, status } = req.body || {};
+        const statusIn = String(status || '').toLowerCase().trim();
+        const allowed = new Set(['pending', 'accepted', 'rejected', 'completed']);
+
+        if (!ObjectId.isValid(applicationId)) return res.status(400).json({ error: 'Invalid application id' });
+        if (!allowed.has(statusIn)) return res.status(400).json({ error: 'Invalid status' });
+
+        const _id = new ObjectId(applicationId);
+        const upd = await applicationsCollection.updateOne(
+          { _id },
+          { $set: { status: statusIn, updatedAt: new Date() } }
+        );
+
+        if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
+
+        const doc = await applicationsCollection.findOne({ _id });
+        res.json(doc);
+      } catch (err) {
+        console.error('POST /api/applications/update-status failed:', err);
+        res.status(500).json({ error: 'Failed to update status' });
+      }
+    });
+
 
 
 
     // ===== BROWSE JOBS =====
     app.get('/api/browse-jobs', async (req, res) => {
       try {
-        const { clientId, email } = req.query;
+        const { clientId, email, status, sort } = req.query;
         const filter = {};
+
+        // Filter by client
         if (clientId) filter.clientId = String(clientId);
         if (email) filter.postedByEmail = String(email).toLowerCase();
 
-        const jobs = await browseJobsCollection.find(filter).toArray();
+        // Exclude jobs with status 'completed' unless explicitly requested
+        if (status) {
+          filter.status = String(status).toLowerCase();
+        } else {
+          filter.status = { $ne: 'completed' };
+        }
+
+        // (Optional advanced logic: exclude jobs with a worker already accepted/completed by querying applicationsCollection)
+        // if (req.user) { /* you'd need authentication and an additional step here */ }
+        
+        let findQuery = browseJobsCollection.find(filter);
+        
+        // Sorting: default to newest first; only 'oldest' yields ascending
+        if (sort === 'oldest') {
+          findQuery = findQuery.sort({ createdAt: 1 }); // oldest first
+        } else {
+          findQuery = findQuery.sort({ createdAt: -1 }); // newest first (default)
+        }
+
+        const jobs = await findQuery.toArray();
         res.json(jobs);
       } catch (err) {
         console.error('GET /api/browse-jobs failed:', err);
@@ -669,23 +874,29 @@ async function startServer() {
     app.get('/api/browse-jobs/:id', async (req, res) => {
       try {
         const { id } = req.params;
-        if (!ObjectId.isValid(id)) return res.status(404).json({ error: 'Job not found' });
+        console.log('🔍 Fetching job with ID:', id);
+        
+        if (!id) {
+          return res.status(400).json({ error: 'Job ID is required' });
+        }
+        
+        if (!ObjectId.isValid(id)) {
+          console.log('❌ Invalid ObjectId format:', id);
+          return res.status(400).json({ error: 'Invalid job ID format' });
+        }
+        
         const job = await browseJobsCollection.findOne({ _id: new ObjectId(id) });
-        if (!job) return res.status(404).json({ error: 'Job not found' });
+        if (!job) {
+          console.log('❌ Job not found in database:', id);
+          return res.status(404).json({ error: 'Job not found' });
+        }
+        
+        console.log('✅ Job found:', job.title);
         res.json(job);
       } catch (e) {
         console.error('GET /api/browse-jobs/:id failed:', e);
         res.status(500).json({ error: 'Failed to fetch job' });
       }
-    });
-
-    app.post('/api/browse-jobs/upload', upload.array('images', 10), (req, res) => {
-      if (!req.files || req.files.length === 0) {
-        return res.status(400).json({ error: 'No files uploaded' });
-      }
-      const base = `${req.protocol}://${req.get('host')}`;
-      const imageUrls = req.files.map((file) => `${base}/uploads/${file.filename}`);
-      res.json({ imageUrls });
     });
 
     app.post('/api/browse-jobs', async (req, res) => {
@@ -700,6 +911,279 @@ async function startServer() {
       } catch (err) {
         console.error('❌ Failed to post job:', err);
         res.status(500).json({ error: 'Failed to post job' });
+      }
+    });
+
+    app.post('/api/browse-jobs/upload', upload.array('images', 10), (req, res) => {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+      }
+      const base = `${req.protocol}://${req.get('host')}`;
+      const imageUrls = req.files.map((file) => `${base}/uploads/${file.filename}`);
+      res.json({ imageUrls });
+    });
+
+    // Update job (PATCH/PUT)
+    app.patch('/api/browse-jobs/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        const job = await browseJobsCollection.findOne({ _id: new ObjectId(id) });
+        if (!job) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        // Prepare update data (exclude _id and createdAt)
+        const updateData = { ...req.body };
+        delete updateData._id;
+        delete updateData.createdAt;
+        updateData.updatedAt = new Date();
+
+        const result = await browseJobsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        const updatedJob = await browseJobsCollection.findOne({ _id: new ObjectId(id) });
+        res.json({ message: '✅ Job updated successfully', job: updatedJob });
+      } catch (err) {
+        console.error('❌ Failed to update job:', err);
+        res.status(500).json({ error: 'Failed to update job' });
+      }
+    });
+
+    app.put('/api/browse-jobs/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        const job = await browseJobsCollection.findOne({ _id: new ObjectId(id) });
+        if (!job) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        // Prepare update data (preserve _id and createdAt)
+        const updateData = { ...req.body };
+        delete updateData._id;
+        if (job.createdAt) {
+          updateData.createdAt = job.createdAt;
+        }
+        updateData.updatedAt = new Date();
+
+        const result = await browseJobsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        const updatedJob = await browseJobsCollection.findOne({ _id: new ObjectId(id) });
+        res.json({ message: '✅ Job updated successfully', job: updatedJob });
+      } catch (err) {
+        console.error('❌ Failed to update job:', err);
+        res.status(500).json({ error: 'Failed to update job' });
+      }
+    });
+
+    // Delete job
+    app.delete('/api/browse-jobs/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        const job = await browseJobsCollection.findOne({ _id: new ObjectId(id) });
+        if (!job) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        // Optionally: Check if job has accepted applications before deleting
+        // For now, we'll allow deletion but could add this check later
+        const hasAcceptedApplications = await applicationsCollection.findOne({
+          jobId: String(id),
+          status: 'accepted'
+        });
+
+        if (hasAcceptedApplications) {
+          return res.status(400).json({ 
+            error: 'Cannot delete job with accepted applications. Please complete or cancel the job first.' 
+          });
+        }
+
+        const result = await browseJobsCollection.deleteOne({ _id: new ObjectId(id) });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        // Optionally: Delete related applications
+        await applicationsCollection.deleteMany({ jobId: String(id) });
+
+        res.json({ message: '✅ Job deleted successfully' });
+      } catch (err) {
+        console.error('❌ Failed to delete job:', err);
+        res.status(500).json({ error: 'Failed to delete job' });
+      }
+    });
+
+    // ===== MESSAGING =====
+
+    // Helper function to generate conversation ID
+    const getConversationId = (userId1, userId2, jobId) => {
+      const ids = [userId1, userId2].sort();
+      return jobId ? `${jobId}_${ids.join('_')}` : ids.join('_');
+    };
+
+    // Get conversations for a user
+    app.get('/api/messages/conversations', async (req, res) => {
+      try {
+        const { userId } = req.query;
+        if (!userId) {
+          return res.status(400).json({ error: 'userId is required' });
+        }
+
+        // Get all unique conversations for this user
+        const conversations = await messagesCollection
+          .aggregate([
+            {
+              $match: {
+                $or: [{ senderId: userId }, { recipientId: userId }]
+              }
+            },
+            {
+              $sort: { createdAt: -1 }
+            },
+            {
+              $group: {
+                _id: '$conversationId',
+                lastMessage: { $first: '$$ROOT' },
+                unreadCount: {
+                  $sum: {
+                    $cond: [
+                      { $and: [{ $eq: ['$recipientId', userId] }, { $eq: ['$read', false] }] },
+                      1,
+                      0
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              $sort: { 'lastMessage.createdAt': -1 }
+            }
+          ])
+          .toArray();
+
+        res.json(conversations);
+      } catch (err) {
+        console.error('❌ Failed to fetch conversations:', err);
+        res.status(500).json({ error: 'Failed to fetch conversations' });
+      }
+    });
+
+    // Get messages for a conversation
+    app.get('/api/messages/conversation/:conversationId', async (req, res) => {
+      try {
+        const { conversationId } = req.params;
+        const { userId } = req.query;
+
+        if (!userId) {
+          return res.status(400).json({ error: 'userId is required' });
+        }
+
+        const messages = await messagesCollection
+          .find({ conversationId })
+          .sort({ createdAt: 1 })
+          .toArray();
+
+        // Mark messages as read
+        await messagesCollection.updateMany(
+          {
+            conversationId,
+            recipientId: userId,
+            read: false
+          },
+          {
+            $set: { read: true, readAt: new Date() }
+          }
+        );
+
+        res.json(messages);
+      } catch (err) {
+        console.error('❌ Failed to fetch messages:', err);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+      }
+    });
+
+    // Send a message
+    app.post('/api/messages', async (req, res) => {
+      try {
+        const { senderId, recipientId, jobId, message, senderName, recipientName } = req.body;
+
+        if (!senderId || !recipientId || !message) {
+          return res.status(400).json({ error: 'senderId, recipientId, and message are required' });
+        }
+
+        const conversationId = getConversationId(senderId, recipientId, jobId);
+
+        const newMessage = {
+          conversationId,
+          senderId,
+          recipientId,
+          jobId: jobId || null,
+          message: String(message).trim(),
+          senderName: senderName || '',
+          recipientName: recipientName || '',
+          read: false,
+          createdAt: new Date(),
+        };
+
+        const result = await messagesCollection.insertOne(newMessage);
+        const insertedMessage = await messagesCollection.findOne({ _id: result.insertedId });
+
+        res.status(201).json(insertedMessage);
+      } catch (err) {
+        console.error('❌ Failed to send message:', err);
+        res.status(500).json({ error: 'Failed to send message' });
+      }
+    });
+
+    // Mark messages as read
+    app.patch('/api/messages/read', async (req, res) => {
+      try {
+        const { conversationId, userId } = req.body;
+
+        if (!conversationId || !userId) {
+          return res.status(400).json({ error: 'conversationId and userId are required' });
+        }
+
+        const result = await messagesCollection.updateMany(
+          {
+            conversationId,
+            recipientId: userId,
+            read: false
+          },
+          {
+            $set: { read: true, readAt: new Date() }
+          }
+        );
+
+        res.json({ updated: result.modifiedCount });
+      } catch (err) {
+        console.error('❌ Failed to mark messages as read:', err);
+        res.status(500).json({ error: 'Failed to mark messages as read' });
       }
     });
 
