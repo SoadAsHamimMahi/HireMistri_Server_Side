@@ -6,10 +6,26 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const { Server } = require('socket.io');
+const cron = require('node-cron');
+const {
+  sendApplicationReceivedEmail,
+  sendApplicationStatusEmail,
+  sendJobStatusEmail,
+  sendNewMessageEmail,
+} = require('./utils/emailService');
 
 dotenv.config();
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
@@ -68,6 +84,8 @@ let usersCollection;
 let jobsCollection;
 let applicationsCollection;
 let browseJobsCollection;
+let notificationsCollection;
+let savedJobsCollection;
 
 async function startServer() {
   try {
@@ -80,6 +98,8 @@ async function startServer() {
     applicationsCollection = db.collection('applications');
     browseJobsCollection = db.collection('browseJobs');
     messagesCollection = db.collection('messages');
+    notificationsCollection = db.collection('notifications');
+    savedJobsCollection = db.collection('savedJobs');
 
     // ---------- indexes ----------
     await usersCollection.createIndex({ uid: 1 }, { unique: true, sparse: true });
@@ -102,6 +122,14 @@ async function startServer() {
     await messagesCollection.createIndex({ recipientId: 1 });
     await messagesCollection.createIndex({ jobId: 1 });
 
+    // Notifications indexes
+    await notificationsCollection.createIndex({ userId: 1, read: 1, createdAt: -1 });
+    await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
+
+    // Saved Jobs indexes
+    await savedJobsCollection.createIndex({ userId: 1, jobId: 1 }, { unique: true });
+    await savedJobsCollection.createIndex({ userId: 1, savedAt: -1 });
+
     // ---------- helpers ----------
     function pruneEmpty(obj) {
       Object.keys(obj).forEach((k) => {
@@ -111,6 +139,35 @@ async function startServer() {
         if (v === '' || v === undefined || isEmptyObj) delete obj[k];
       });
       return obj;
+    }
+
+    // Helper function to create and emit notification
+    async function createNotification(userId, title, message, type = 'info', jobId = null, link = null) {
+      if (!userId) return null;
+      
+      try {
+        const notification = {
+          userId,
+          title,
+          message,
+          type, // 'info', 'success', 'warning', 'error'
+          jobId: jobId || null,
+          link: link || null,
+          read: false,
+          createdAt: new Date(),
+        };
+
+        const result = await notificationsCollection.insertOne(notification);
+        const insertedNotification = await notificationsCollection.findOne({ _id: result.insertedId });
+
+        // Emit notification via WebSocket to the user's room
+        io.to(`user_${userId}`).emit('new_notification', insertedNotification);
+
+        return insertedNotification;
+      } catch (err) {
+        console.error('❌ Failed to create notification:', err);
+        return null;
+      }
     }
 
     // build a $set from only allowed keys that are present on req.body
@@ -380,8 +437,12 @@ async function startServer() {
         // required
         const jobId = s(b.jobId);
         const workerId = s(b.workerId);
-        if (!jobId) return res.status(400).json({ error: 'jobId is required' });
-        if (!workerId) return res.status(400).json({ error: 'workerId is required' });
+        if (!jobId) {
+          return res.status(400).json({ error: 'jobId is required' });
+        }
+        if (!workerId) {
+          return res.status(400).json({ error: 'workerId is required' });
+        }
 
         // incoming (may be blank)
         let workerEmailIn = mail(b.workerEmail || b.postedByEmail);
@@ -394,6 +455,20 @@ async function startServer() {
         // existing doc (to decide $set vs $setOnInsert)
         const existing = await applicationsCollection.findOne({ jobId, workerId });
         const isNew = !existing;
+
+        // Validation: If updating existing application, only allow if status is "pending"
+        if (!isNew && existing) {
+          const currentStatus = (existing.status || 'pending').toLowerCase();
+          if (currentStatus !== 'pending') {
+            return res.status(400).json({ 
+              error: 'Cannot edit application. Only pending applications can be edited.' 
+            });
+          }
+          // Verify ownership
+          if (existing.workerId !== workerId) {
+            return res.status(403).json({ error: 'You do not have permission to edit this application' });
+          }
+        }
 
         // backfill client from job if jobId looks like ObjectId
         if (ObjectId.isValid(jobId) && (!clientIdIn || !clientEmailIn)) {
@@ -457,6 +532,46 @@ async function startServer() {
         );
 
         const doc = await applicationsCollection.findOne({ jobId, workerId });
+        
+        // Send email notification to client if this is a new application
+        if (result.upsertedId && doc) {
+          try {
+            // Get job details for email
+            let jobTitle = 'Your Job';
+            let clientEmail = doc.clientEmail;
+            let clientName = 'Client';
+            
+            if (ObjectId.isValid(jobId)) {
+              const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+              if (jobDoc) {
+                jobTitle = jobDoc.title || jobTitle;
+                clientEmail = clientEmail || jobDoc.postedByEmail || jobDoc.email;
+                // Try to get client name from users collection
+                if (doc.clientId) {
+                  const clientUser = await usersCollection.findOne({ uid: doc.clientId });
+                  if (clientUser) {
+                    clientName = clientUser.displayName || 
+                                [clientUser.firstName, clientUser.lastName].filter(Boolean).join(' ') || 
+                                clientName;
+                    clientEmail = clientEmail || clientUser.email;
+                  }
+                }
+              }
+            }
+            
+            const workerName = doc.workerName || 'A worker';
+            
+            if (clientEmail) {
+              // Send email asynchronously (don't block response)
+              sendApplicationReceivedEmail(clientEmail, clientName, jobTitle, workerName)
+                .catch(err => console.error('Failed to send application received email:', err));
+            }
+          } catch (emailErr) {
+            console.error('Error sending application received email:', emailErr);
+            // Don't fail the request if email fails
+          }
+        }
+        
         return res.status(result.upsertedId ? 201 : 200).json({ ok: true, application: doc });
       } catch (err) {
         if (err?.code === 11000) {
@@ -464,6 +579,26 @@ async function startServer() {
         }
         console.error('POST /api/applications failed:', err);
         return res.status(500).json({ error: err?.message || 'Failed to submit proposal' });
+      }
+    });
+
+    // Get a specific application by jobId and workerId
+    app.get('/api/applications/:jobId/:workerId', async (req, res) => {
+      try {
+        const { jobId, workerId } = req.params;
+        const application = await applicationsCollection.findOne({ 
+          jobId: String(jobId), 
+          workerId: String(workerId) 
+        });
+        
+        if (!application) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+        
+        res.json(application);
+      } catch (err) {
+        console.error('GET /api/applications/:jobId/:workerId failed:', err);
+        res.status(500).json({ error: 'Failed to fetch application' });
       }
     });
 
@@ -764,6 +899,16 @@ async function startServer() {
         if (!allowed.has(statusIn)) return res.status(400).json({ error: 'Invalid status' });
 
         const _id = new ObjectId(id);
+        
+        // Get the application before updating to check if status changed
+        const oldDoc = await applicationsCollection.findOne({ _id });
+        if (!oldDoc) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+        
+        const oldStatus = (oldDoc.status || 'pending').toLowerCase();
+        const statusChanged = oldStatus !== statusIn;
+        
         const upd = await applicationsCollection.updateOne(
           { _id },
           { $set: { status: statusIn, updatedAt: new Date() } }
@@ -772,6 +917,57 @@ async function startServer() {
         if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
 
         const doc = await applicationsCollection.findOne({ _id });
+        
+        // Send email notification and create in-app notification to worker if status changed to accepted/rejected
+        if (statusChanged && (statusIn === 'accepted' || statusIn === 'rejected')) {
+          try {
+            // Get job details
+            let jobTitle = 'the job';
+            if (ObjectId.isValid(doc.jobId)) {
+              const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(doc.jobId) });
+              if (jobDoc) {
+                jobTitle = jobDoc.title || jobTitle;
+              }
+            }
+            
+            // Get worker email and name
+            let workerEmail = doc.workerEmail;
+            let workerName = doc.workerName || 'Worker';
+            
+            if (doc.workerId) {
+              const workerUser = await usersCollection.findOne({ uid: doc.workerId });
+              if (workerUser) {
+                workerName = workerUser.displayName || 
+                            [workerUser.firstName, workerUser.lastName].filter(Boolean).join(' ') || 
+                            workerName;
+                workerEmail = workerEmail || workerUser.email;
+              }
+            }
+            
+            // Create in-app notification
+            if (doc.workerId) {
+              const statusText = statusIn === 'accepted' ? 'accepted' : 'rejected';
+              await createNotification(
+                doc.workerId,
+                `Application ${statusText.charAt(0).toUpperCase() + statusText.slice(1)}`,
+                `Your application for "${jobTitle}" has been ${statusText}.`,
+                statusIn === 'accepted' ? 'success' : 'info',
+                doc.jobId,
+                `/jobs/${doc.jobId}`
+              );
+            }
+            
+            if (workerEmail) {
+              // Send email asynchronously (don't block response)
+              sendApplicationStatusEmail(workerEmail, workerName, jobTitle, statusIn)
+                .catch(err => console.error('Failed to send application status email:', err));
+            }
+          } catch (emailErr) {
+            console.error('Error sending application status email:', emailErr);
+            // Don't fail the request if email fails
+          }
+        }
+        
         res.json(doc);
       } catch (err) {
         console.error('PATCH /api/applications/:id failed:', err);
@@ -802,6 +998,210 @@ async function startServer() {
       } catch (err) {
         console.error('PUT /api/applications/:id failed:', err);
         res.status(500).json({ error: 'Failed to update status' });
+      }
+    });
+
+    // ===== APPLICATION NOTES/COMMENTS =====
+
+    // Add a note/comment to an application
+    app.post('/api/applications/:id/notes', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userId, userName, note } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid application id' });
+        }
+
+        if (!userId || !note || !note.trim()) {
+          return res.status(400).json({ error: 'userId and note are required' });
+        }
+
+        const _id = new ObjectId(id);
+        const application = await applicationsCollection.findOne({ _id });
+        
+        if (!application) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+
+        // Verify user has permission (either client or worker)
+        if (application.clientId !== userId && application.workerId !== userId) {
+          return res.status(403).json({ error: 'You do not have permission to add notes to this application' });
+        }
+
+        // Initialize notes array if it doesn't exist
+        const notes = application.notes || [];
+        const newNote = {
+          _id: new ObjectId(),
+          userId,
+          userName: userName || 'User',
+          note: String(note).trim(),
+          createdAt: new Date(),
+        };
+
+        notes.push(newNote);
+
+        await applicationsCollection.updateOne(
+          { _id },
+          { $set: { notes, updatedAt: new Date() } }
+        );
+
+        res.status(201).json({ message: 'Note added successfully', note: newNote });
+      } catch (err) {
+        console.error('❌ Failed to add note:', err);
+        res.status(500).json({ error: 'Failed to add note' });
+      }
+    });
+
+    // Get notes for an application
+    app.get('/api/applications/:id/notes', async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid application id' });
+        }
+
+        const _id = new ObjectId(id);
+        const application = await applicationsCollection.findOne({ _id });
+        
+        if (!application) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+
+        res.json({ notes: application.notes || [] });
+      } catch (err) {
+        console.error('❌ Failed to fetch notes:', err);
+        res.status(500).json({ error: 'Failed to fetch notes' });
+      }
+    });
+
+    // Delete a note from an application
+    app.delete('/api/applications/:id/notes/:noteId', async (req, res) => {
+      try {
+        const { id, noteId } = req.params;
+        const { userId } = req.body;
+
+        if (!ObjectId.isValid(id) || !ObjectId.isValid(noteId)) {
+          return res.status(400).json({ error: 'Invalid application or note id' });
+        }
+
+        if (!userId) {
+          return res.status(400).json({ error: 'userId is required' });
+        }
+
+        const _id = new ObjectId(id);
+        const application = await applicationsCollection.findOne({ _id });
+        
+        if (!application) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+
+        const notes = application.notes || [];
+        const noteIndex = notes.findIndex(n => String(n._id) === noteId);
+
+        if (noteIndex === -1) {
+          return res.status(404).json({ error: 'Note not found' });
+        }
+
+        // Verify user owns the note
+        if (notes[noteIndex].userId !== userId) {
+          return res.status(403).json({ error: 'You do not have permission to delete this note' });
+        }
+
+        notes.splice(noteIndex, 1);
+
+        await applicationsCollection.updateOne(
+          { _id },
+          { $set: { notes, updatedAt: new Date() } }
+        );
+
+        res.json({ message: 'Note deleted successfully', deleted: true });
+      } catch (err) {
+        console.error('❌ Failed to delete note:', err);
+        res.status(500).json({ error: 'Failed to delete note' });
+      }
+    });
+
+    // Delete application (withdrawal by worker)
+    app.delete('/api/applications/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { workerId } = req.body; // Worker ID from request body (should be authenticated user's ID)
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid application id' });
+        }
+
+        if (!workerId) {
+          return res.status(400).json({ error: 'workerId is required' });
+        }
+
+        const _id = new ObjectId(id);
+
+        // Find the application
+        const application = await applicationsCollection.findOne({ _id });
+        if (!application) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+
+        // Verify ownership - only the worker who submitted can delete
+        if (application.workerId !== workerId) {
+          return res.status(403).json({ error: 'You do not have permission to delete this application' });
+        }
+
+        // Prevent deletion if status is "accepted" or "completed"
+        const status = (application.status || 'pending').toLowerCase();
+        if (status === 'accepted' || status === 'completed') {
+          return res.status(400).json({ 
+            error: 'Cannot withdraw an accepted or completed application. Please contact the client.' 
+          });
+        }
+
+        // Get job details to fetch clientId for notification
+        let clientId = application.clientId;
+        let jobTitle = 'the job';
+        let jobId = application.jobId;
+
+        if (jobId && ObjectId.isValid(jobId)) {
+          const job = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+          if (job) {
+            clientId = clientId || job.clientId || job.postedByUid;
+            jobTitle = job.title || jobTitle;
+          }
+        }
+
+        // Delete the application
+        const result = await applicationsCollection.deleteOne({ _id });
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+
+        // Create notification for the client if clientId exists
+        if (clientId) {
+          const notification = {
+            userId: clientId,
+            type: 'application_withdrawn',
+            title: 'Application Withdrawn',
+            message: `${application.workerName || 'A worker'} withdrew their application for "${jobTitle}"`,
+            jobId: jobId || null,
+            applicationId: String(id),
+            workerId: application.workerId,
+            workerName: application.workerName || 'Unknown Worker',
+            read: false,
+            createdAt: new Date(),
+          };
+
+          await notificationsCollection.insertOne(notification);
+        }
+
+        res.json({ 
+          message: '✅ Application withdrawn successfully',
+          deleted: true 
+        });
+      } catch (err) {
+        console.error('❌ DELETE /api/applications/:id failed:', err);
+        res.status(500).json({ error: 'Failed to withdraw application' });
       }
     });
 
@@ -837,37 +1237,251 @@ async function startServer() {
     // ===== BROWSE JOBS =====
     app.get('/api/browse-jobs', async (req, res) => {
       try {
-        const { clientId, email, status, sort } = req.query;
+        const {
+          clientId, 
+          email, 
+          status, 
+          sort,
+          // Advanced search filters
+          skills,
+          dateFrom,
+          dateTo,
+          budgetMin,
+          budgetMax,
+          categories,
+          lat,
+          lng,
+          radius,
+          sortBy
+        } = req.query;
+        
         const filter = {};
 
         // Filter by client
         if (clientId) filter.clientId = String(clientId);
         if (email) filter.postedByEmail = String(email).toLowerCase();
 
-        // Exclude jobs with status 'completed' unless explicitly requested
+        // Status filter
         if (status) {
-          filter.status = String(status).toLowerCase();
+          const statusLower = String(status).toLowerCase();
+          if (statusLower === 'all') {
+            // Don't filter by status - return all jobs
+          } else {
+            filter.status = statusLower;
+          }
         } else {
           filter.status = { $ne: 'completed' };
         }
 
-        // (Optional advanced logic: exclude jobs with a worker already accepted/completed by querying applicationsCollection)
-        // if (req.user) { /* you'd need authentication and an additional step here */ }
-        
-        let findQuery = browseJobsCollection.find(filter);
-        
-        // Sorting: default to newest first; only 'oldest' yields ascending
-        if (sort === 'oldest') {
-          findQuery = findQuery.sort({ createdAt: 1 }); // oldest first
-        } else {
-          findQuery = findQuery.sort({ createdAt: -1 }); // newest first (default)
+        // Skills filter (comma-separated, matches any)
+        if (skills) {
+          const skillsArray = String(skills).split(',').map(s => s.trim()).filter(Boolean);
+          if (skillsArray.length > 0) {
+            // Match if job skills array contains any of the requested skills (case-insensitive)
+            filter.$or = filter.$or || [];
+            filter.$or.push({
+              skills: { $in: skillsArray.map(s => new RegExp(s, 'i')) }
+            });
+          }
         }
 
-        const jobs = await findQuery.toArray();
+        // Date range filter
+        if (dateFrom || dateTo) {
+          filter.date = {};
+          if (dateFrom) {
+            filter.date.$gte = String(dateFrom);
+          }
+          if (dateTo) {
+            filter.date.$lte = String(dateTo);
+          }
+        }
+
+        // Budget range filter
+        if (budgetMin || budgetMax) {
+          filter.budget = {};
+          if (budgetMin) {
+            filter.budget.$gte = Number(budgetMin);
+          }
+          if (budgetMax) {
+            filter.budget.$lte = Number(budgetMax);
+          }
+        }
+
+        // Multiple categories filter (comma-separated)
+        if (categories) {
+          const categoriesArray = String(categories).split(',').map(c => c.trim()).filter(Boolean);
+          if (categoriesArray.length > 0) {
+            filter.category = { $in: categoriesArray };
+          }
+        }
+
+        // Location radius search (requires lat, lng, and radius)
+        let jobs = [];
+        if (lat && lng && radius) {
+          const userLat = Number(lat);
+          const userLng = Number(lng);
+          const radiusKm = Number(radius);
+          
+          // Get all jobs first, then filter by distance
+          jobs = await browseJobsCollection.find(filter).toArray();
+          
+          // Calculate distance for each job (Haversine formula)
+          jobs = jobs.map(job => {
+            if (job.latitude && job.longitude) {
+              const jobLat = Number(job.latitude);
+              const jobLng = Number(job.longitude);
+              
+              // Haversine formula
+              const R = 6371; // Earth's radius in km
+              const dLat = (jobLat - userLat) * Math.PI / 180;
+              const dLng = (jobLng - userLng) * Math.PI / 180;
+              const a = 
+                Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(userLat * Math.PI / 180) * Math.cos(jobLat * Math.PI / 180) *
+                Math.sin(dLng / 2) * Math.sin(dLng / 2);
+              const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+              const distance = R * c;
+              
+              return { ...job, _distance: distance };
+            }
+            return { ...job, _distance: null };
+          });
+          
+          // Filter by radius
+          jobs = jobs.filter(job => job._distance !== null && job._distance <= radiusKm);
+          
+          // Sort by distance if requested
+          if (sortBy === 'distance') {
+            jobs.sort((a, b) => (a._distance || Infinity) - (b._distance || Infinity));
+          } else {
+            // Default sorting
+            jobs.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+          }
+        } else {
+          // Standard query without radius search
+          let findQuery = browseJobsCollection.find(filter);
+          
+          // Sorting
+          if (sort === 'oldest') {
+            findQuery = findQuery.sort({ createdAt: 1 });
+          } else {
+            findQuery = findQuery.sort({ createdAt: -1 });
+          }
+          
+          jobs = await findQuery.toArray();
+        }
+
         res.json(jobs);
       } catch (err) {
         console.error('GET /api/browse-jobs failed:', err);
         res.status(500).json({ error: 'Failed to fetch browse jobs' });
+      }
+    });
+
+    // Get job recommendations for a user
+    app.get('/api/jobs/recommendations/:userId', async (req, res) => {
+      try {
+        const { userId } = req.params;
+        if (!userId) {
+          return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        // Get user profile
+        const user = await usersCollection.findOne({ uid: userId });
+        if (!user) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Get user skills and location
+        const userSkills = user.skills || [];
+        const userLocation = user.location || null; // { lat, lng, address }
+
+        // Get jobs user has already applied to
+        const userApplications = await applicationsCollection.find({ workerId: userId }).toArray();
+        const appliedJobIds = userApplications.map(app => app.jobId);
+
+        // Query active jobs
+        const allJobs = await browseJobsCollection.find({
+          status: 'active',
+          _id: { $nin: appliedJobIds.map(id => new ObjectId(id)) }
+        }).toArray();
+
+        // Score each job
+        const scoredJobs = allJobs.map(job => {
+          let score = 0;
+          const reasons = [];
+
+          // Skills matching
+          if (userSkills.length > 0 && Array.isArray(job.skills)) {
+            const matchingSkills = job.skills.filter(skill => 
+              userSkills.some(us => 
+                String(us).toLowerCase() === String(skill).toLowerCase()
+              )
+            );
+            if (matchingSkills.length > 0) {
+              score += matchingSkills.length * 10;
+              reasons.push(`Matches ${matchingSkills.length} skill${matchingSkills.length > 1 ? 's' : ''}`);
+            }
+          }
+
+          // Location proximity
+          if (userLocation && userLocation.lat && userLocation.lng && job.location) {
+            // Try to extract coordinates from job (if stored)
+            const jobLat = job.lat || job.latitude || job.locationLat;
+            const jobLng = job.lng || job.longitude || job.locationLng;
+            
+            if (jobLat && jobLng) {
+              // Haversine formula for distance
+              const R = 6371; // Earth radius in km
+              const dLat = (jobLat - userLocation.lat) * Math.PI / 180;
+              const dLng = (jobLng - userLocation.lng) * Math.PI / 180;
+              const a = 
+                Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(userLocation.lat * Math.PI / 180) *
+                Math.cos(jobLat * Math.PI / 180) *
+                Math.sin(dLng / 2) * Math.sin(dLng / 2);
+              const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+              const distance = R * c;
+
+              if (distance <= 10) {
+                score += 20;
+                reasons.push(`Very close (${distance.toFixed(1)} km)`);
+              } else if (distance <= 25) {
+                score += 10;
+                reasons.push(`Nearby (${distance.toFixed(1)} km)`);
+              } else if (distance <= 50) {
+                score += 5;
+                reasons.push(`Within range (${distance.toFixed(1)} km)`);
+              }
+            }
+          }
+
+          // Recent jobs (posted within 7 days)
+          if (job.createdAt) {
+            const daysSincePosted = (new Date() - new Date(job.createdAt)) / (1000 * 60 * 60 * 24);
+            if (daysSincePosted <= 7) {
+              score += 5;
+              reasons.push('Recently posted');
+            }
+          }
+
+          return {
+            ...job,
+            recommendationScore: score,
+            recommendationReasons: reasons,
+          };
+        });
+
+        // Sort by score (descending) and return top 10
+        const recommendations = scoredJobs
+          .filter(job => job.recommendationScore > 0) // Only jobs with some match
+          .sort((a, b) => b.recommendationScore - a.recommendationScore)
+          .slice(0, 10);
+
+        res.json(recommendations);
+      } catch (err) {
+        console.error('❌ Failed to get job recommendations:', err);
+        res.status(500).json({ error: 'Failed to get job recommendations' });
       }
     });
 
@@ -901,12 +1515,29 @@ async function startServer() {
 
     app.post('/api/browse-jobs', async (req, res) => {
       try {
-        const result = await browseJobsCollection.insertOne({
-          ...req.body,
+        const { expiresAt, ...jobData } = req.body;
+        
+        // Validate expiration date if provided
+        if (expiresAt) {
+          const expirationDate = new Date(expiresAt);
+          if (isNaN(expirationDate.getTime())) {
+            return res.status(400).json({ error: 'Invalid expiration date format' });
+          }
+          if (expirationDate <= new Date()) {
+            return res.status(400).json({ error: 'Expiration date must be in the future' });
+          }
+        }
+
+        const jobDoc = {
+          ...jobData,
           status: 'active',
           date: new Date().toISOString().split('T')[0],
           createdAt: new Date(),
-        });
+          expiresAt: expiresAt ? new Date(expiresAt) : null,
+          autoCloseEnabled: !!expiresAt,
+        };
+
+        const result = await browseJobsCollection.insertOne(jobDoc);
         res.status(201).json({ message: '✅ Job posted successfully', jobId: result.insertedId });
       } catch (err) {
         console.error('❌ Failed to post job:', err);
@@ -927,6 +1558,8 @@ async function startServer() {
     app.patch('/api/browse-jobs/:id', async (req, res) => {
       try {
         const { id } = req.params;
+        const { clientId, status } = req.body;
+        
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({ error: 'Invalid job ID' });
         }
@@ -936,10 +1569,65 @@ async function startServer() {
           return res.status(404).json({ error: 'Job not found' });
         }
 
+        // Validate ownership if clientId is provided
+        if (clientId && job.clientId && job.clientId !== clientId) {
+          return res.status(403).json({ error: 'You do not have permission to update this job' });
+        }
+
+        // Validate status transitions if status is being updated
+        if (status) {
+          const currentStatus = (job.status || 'active').toLowerCase();
+          const newStatus = String(status).toLowerCase();
+          const allowedStatuses = ['active', 'on-hold', 'cancelled', 'completed'];
+          
+          if (!allowedStatuses.includes(newStatus)) {
+            return res.status(400).json({ error: `Invalid status. Allowed: ${allowedStatuses.join(', ')}` });
+          }
+
+          // Status transition rules
+          if (currentStatus === 'cancelled' || currentStatus === 'completed') {
+            return res.status(400).json({ 
+              error: `Cannot change status from ${currentStatus}. This is a final state.` 
+            });
+          }
+
+          if (currentStatus === 'on-hold' && newStatus === 'active') {
+            // Allowed: on-hold → active
+          } else if (currentStatus === 'active' && ['on-hold', 'cancelled', 'completed'].includes(newStatus)) {
+            // Allowed: active → on-hold, cancelled, completed
+          } else if (currentStatus === 'on-hold' && ['cancelled'].includes(newStatus)) {
+            // Allowed: on-hold → cancelled
+          } else if (currentStatus !== newStatus) {
+            return res.status(400).json({ 
+              error: `Invalid status transition from ${currentStatus} to ${newStatus}` 
+            });
+          }
+        }
+
+        // Handle expiration date if provided
+        if (req.body.expiresAt !== undefined) {
+          if (req.body.expiresAt === null || req.body.expiresAt === '') {
+            // Clear expiration
+            req.body.expiresAt = null;
+            req.body.autoCloseEnabled = false;
+          } else {
+            const expirationDate = new Date(req.body.expiresAt);
+            if (isNaN(expirationDate.getTime())) {
+              return res.status(400).json({ error: 'Invalid expiration date format' });
+            }
+            if (expirationDate <= new Date()) {
+              return res.status(400).json({ error: 'Expiration date must be in the future' });
+            }
+            req.body.expiresAt = expirationDate;
+            req.body.autoCloseEnabled = true;
+          }
+        }
+
         // Prepare update data (exclude _id and createdAt)
         const updateData = { ...req.body };
         delete updateData._id;
         delete updateData.createdAt;
+        delete updateData.clientId; // Don't allow changing clientId
         updateData.updatedAt = new Date();
 
         const result = await browseJobsCollection.updateOne(
@@ -952,6 +1640,53 @@ async function startServer() {
         }
 
         const updatedJob = await browseJobsCollection.findOne({ _id: new ObjectId(id) });
+        
+        // Send email notification and create in-app notification to client if job status changed
+        if (status && job.status !== newStatus) {
+          try {
+            let clientEmail = null;
+            let clientName = 'Client';
+            const jobTitle = updatedJob.title || 'Your Job';
+            
+            // Get client email from users collection
+            if (updatedJob.clientId) {
+              const clientUser = await usersCollection.findOne({ uid: updatedJob.clientId });
+              if (clientUser) {
+                clientEmail = clientUser.email;
+                clientName = clientUser.displayName || 
+                            [clientUser.firstName, clientUser.lastName].filter(Boolean).join(' ') || 
+                            clientName;
+              }
+            }
+            
+            // Fallback to job email if available
+            if (!clientEmail && updatedJob.postedByEmail) {
+              clientEmail = updatedJob.postedByEmail;
+            }
+            
+            // Create in-app notification
+            if (updatedJob.clientId) {
+              await createNotification(
+                updatedJob.clientId,
+                'Job Status Updated',
+                `Your job "${jobTitle}" status has been updated to ${newStatus.charAt(0).toUpperCase() + newStatus.slice(1)}.`,
+                'info',
+                id,
+                `/My-Posted-Job-Details/${id}`
+              );
+            }
+            
+            if (clientEmail) {
+              // Send email asynchronously (don't block response)
+              sendJobStatusEmail(clientEmail, clientName, jobTitle, newStatus)
+                .catch(err => console.error('Failed to send job status email:', err));
+            }
+          } catch (emailErr) {
+            console.error('Error sending job status email:', emailErr);
+            // Don't fail the request if email fails
+          }
+        }
+        
         res.json({ message: '✅ Job updated successfully', job: updatedJob });
       } catch (err) {
         console.error('❌ Failed to update job:', err);
@@ -1153,6 +1888,55 @@ async function startServer() {
         const result = await messagesCollection.insertOne(newMessage);
         const insertedMessage = await messagesCollection.findOne({ _id: result.insertedId });
 
+        // Send email notification and create in-app notification to recipient (asynchronously, don't block response)
+        (async () => {
+          try {
+            let recipientEmail = null;
+            let recipientName = insertedMessage.recipientName || 'User';
+            let jobTitle = null;
+            
+            // Get recipient email from users collection
+            if (recipientId) {
+              const recipientUser = await usersCollection.findOne({ uid: recipientId });
+              if (recipientUser) {
+                recipientEmail = recipientUser.email;
+                recipientName = recipientUser.displayName || 
+                               [recipientUser.firstName, recipientUser.lastName].filter(Boolean).join(' ') || 
+                               recipientName;
+              }
+            }
+            
+            // Get job title if jobId exists
+            if (jobId && ObjectId.isValid(jobId)) {
+              const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+              if (jobDoc) {
+                jobTitle = jobDoc.title;
+              }
+            }
+            
+            const senderName = insertedMessage.senderName || 'Someone';
+            
+            // Create in-app notification
+            if (recipientId) {
+              await createNotification(
+                recipientId,
+                'New Message',
+                `You have a new message from ${senderName}${jobTitle ? ` about "${jobTitle}"` : ''}`,
+                'info',
+                jobId,
+                null // Link will be handled by the frontend based on jobId
+              );
+            }
+            
+            if (recipientEmail) {
+              sendNewMessageEmail(recipientEmail, recipientName, senderName, jobTitle)
+                .catch(err => console.error('Failed to send new message email:', err));
+            }
+          } catch (emailErr) {
+            console.error('Error sending new message email:', emailErr);
+          }
+        })();
+
         res.status(201).json(insertedMessage);
       } catch (err) {
         console.error('❌ Failed to send message:', err);
@@ -1187,6 +1971,374 @@ async function startServer() {
       }
     });
 
+    // ===== NOTIFICATIONS =====
+
+    // Get notifications for a user
+    app.get('/api/notifications/:userId', async (req, res) => {
+      try {
+        const { userId } = req.params;
+        const { limit = 50 } = req.query;
+
+        if (!userId) {
+          return res.status(400).json({ error: 'userId is required' });
+        }
+
+        // Fetch notifications sorted by newest first
+        const notifications = await notificationsCollection
+          .find({ userId })
+          .sort({ createdAt: -1 })
+          .limit(parseInt(limit))
+          .toArray();
+
+        // Count unread notifications
+        const unreadCount = await notificationsCollection.countDocuments({
+          userId,
+          read: false
+        });
+
+        res.json({
+          notifications,
+          unreadCount
+        });
+      } catch (err) {
+        console.error('❌ Failed to fetch notifications:', err);
+        res.status(500).json({ error: 'Failed to fetch notifications' });
+      }
+    });
+
+    // Mark notification as read
+    app.patch('/api/notifications/:id/read', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userId } = req.body; // Optional: verify ownership
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid notification id' });
+        }
+
+        const _id = new ObjectId(id);
+
+        // Optional: Verify ownership if userId provided
+        const updateQuery = { _id };
+        if (userId) {
+          updateQuery.userId = userId;
+        }
+
+        const result = await notificationsCollection.updateOne(
+          updateQuery,
+          {
+            $set: { read: true, readAt: new Date() }
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Notification not found' });
+        }
+
+        res.json({ message: 'Notification marked as read', updated: true });
+      } catch (err) {
+        console.error('❌ Failed to mark notification as read:', err);
+        res.status(500).json({ error: 'Failed to mark notification as read' });
+      }
+    });
+
+    // Delete notification
+    app.delete('/api/notifications/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userId } = req.body; // Optional: verify ownership
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid notification id' });
+        }
+
+        const _id = new ObjectId(id);
+
+        // Optional: Verify ownership if userId provided
+        const deleteQuery = { _id };
+        if (userId) {
+          deleteQuery.userId = userId;
+        }
+
+        const result = await notificationsCollection.deleteOne(deleteQuery);
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: 'Notification not found' });
+        }
+
+        res.json({ message: 'Notification deleted successfully', deleted: true });
+      } catch (err) {
+        console.error('❌ Failed to delete notification:', err);
+        res.status(500).json({ error: 'Failed to delete notification' });
+      }
+    });
+
+    // ===== SAVED JOBS / BOOKMARKS =====
+
+    // Save a job
+    app.post('/api/saved-jobs', async (req, res) => {
+      try {
+        const { userId, jobId } = req.body;
+
+        if (!userId || !jobId) {
+          return res.status(400).json({ error: 'userId and jobId are required' });
+        }
+
+        // Validate job exists
+        if (ObjectId.isValid(jobId)) {
+          const job = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+          if (!job) {
+            return res.status(404).json({ error: 'Job not found' });
+          }
+        }
+
+        // Check if already saved
+        const existing = await savedJobsCollection.findOne({ userId, jobId });
+        if (existing) {
+          return res.status(409).json({ error: 'Job is already saved' });
+        }
+
+        // Save the job
+        const result = await savedJobsCollection.insertOne({
+          userId,
+          jobId,
+          savedAt: new Date()
+        });
+
+        res.status(201).json({ 
+          message: 'Job saved successfully', 
+          savedJob: { _id: result.insertedId, userId, jobId, savedAt: new Date() }
+        });
+      } catch (err) {
+        if (err.code === 11000) {
+          return res.status(409).json({ error: 'Job is already saved' });
+        }
+        console.error('❌ Failed to save job:', err);
+        res.status(500).json({ error: 'Failed to save job' });
+      }
+    });
+
+    // Get all saved jobs for a user
+    app.get('/api/saved-jobs/:userId', async (req, res) => {
+      try {
+        const { userId } = req.params;
+
+        if (!userId) {
+          return res.status(400).json({ error: 'userId is required' });
+        }
+
+        // Get saved jobs
+        const savedJobs = await savedJobsCollection
+          .find({ userId })
+          .sort({ savedAt: -1 })
+          .toArray();
+
+        // Get full job details for each saved job
+        const jobsWithDetails = await Promise.all(
+          savedJobs.map(async (saved) => {
+            if (ObjectId.isValid(saved.jobId)) {
+              const job = await browseJobsCollection.findOne({ _id: new ObjectId(saved.jobId) });
+              return job ? { ...job, savedAt: saved.savedAt, savedJobId: saved._id } : null;
+            }
+            return null;
+          })
+        );
+
+        const validJobs = jobsWithDetails.filter(job => job !== null);
+        res.json(validJobs);
+      } catch (err) {
+        console.error('❌ Failed to fetch saved jobs:', err);
+        res.status(500).json({ error: 'Failed to fetch saved jobs' });
+      }
+    });
+
+    // Check if a job is saved
+    app.get('/api/saved-jobs/check/:userId/:jobId', async (req, res) => {
+      try {
+        const { userId, jobId } = req.params;
+
+        if (!userId || !jobId) {
+          return res.status(400).json({ error: 'userId and jobId are required' });
+        }
+
+        const savedJob = await savedJobsCollection.findOne({ userId, jobId });
+        res.json({ 
+          saved: !!savedJob, 
+          savedJobId: savedJob ? String(savedJob._id) : null 
+        });
+      } catch (err) {
+        console.error('❌ Failed to check saved job:', err);
+        res.status(500).json({ error: 'Failed to check saved job' });
+      }
+    });
+
+    // Unsave a job
+    app.delete('/api/saved-jobs/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userId } = req.body; // Optional: verify ownership
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid saved job id' });
+        }
+
+        const _id = new ObjectId(id);
+
+        // Verify ownership if userId provided
+        const deleteQuery = { _id };
+        if (userId) {
+          deleteQuery.userId = userId;
+        }
+
+        const result = await savedJobsCollection.deleteOne(deleteQuery);
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: 'Saved job not found' });
+        }
+
+        res.json({ message: 'Job unsaved successfully', deleted: true });
+      } catch (err) {
+        console.error('❌ Failed to unsave job:', err);
+        res.status(500).json({ error: 'Failed to unsave job' });
+      }
+    });
+
+    // ---------- WebSocket handlers ----------
+    io.on('connection', (socket) => {
+      console.log('🔌 Client connected:', socket.id);
+
+      // Join user room
+      socket.on('join_user', (userId) => {
+        socket.join(`user_${userId}`);
+        console.log(`👤 User ${userId} joined room: user_${userId}`);
+      });
+
+      // Send message via WebSocket
+      socket.on('message:send', async (data) => {
+        const { senderId, recipientId, jobId, message, senderName, recipientName } = data;
+        if (!senderId || !recipientId || !message) {
+          socket.emit('message_error', { error: 'senderId, recipientId, and message are required' });
+          return;
+        }
+
+        const conversationId = getConversationId(senderId, recipientId, jobId);
+        const newMessage = {
+          conversationId,
+          senderId,
+          recipientId,
+          jobId: jobId || null,
+          message: String(message).trim(),
+          senderName: senderName || '',
+          recipientName: recipientName || '',
+          read: false,
+          createdAt: new Date(),
+        };
+
+        try {
+          const result = await messagesCollection.insertOne(newMessage);
+          const insertedMessage = await messagesCollection.findOne({ _id: result.insertedId });
+
+          // Emit to sender's room (for confirmation/UI update)
+          io.to(`user_${senderId}`).emit('new_message', insertedMessage);
+          // Emit to recipient's room
+          io.to(`user_${recipientId}`).emit('new_message', insertedMessage);
+
+          // Also emit to the conversation room if it exists
+          io.to(conversationId).emit('new_message', insertedMessage);
+          
+          // Send email notification and create in-app notification to recipient (asynchronously, don't block)
+          (async () => {
+            try {
+              let recipientEmail = null;
+              let recipientName = insertedMessage.recipientName || 'User';
+              let jobTitle = null;
+              
+              // Get recipient email from users collection
+              if (recipientId) {
+                const recipientUser = await usersCollection.findOne({ uid: recipientId });
+                if (recipientUser) {
+                  recipientEmail = recipientUser.email;
+                  recipientName = recipientUser.displayName || 
+                                 [recipientUser.firstName, recipientUser.lastName].filter(Boolean).join(' ') || 
+                                 recipientName;
+                }
+              }
+              
+              // Get job title if jobId exists
+              if (jobId && ObjectId.isValid(jobId)) {
+                const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+                if (jobDoc) {
+                  jobTitle = jobDoc.title;
+                }
+              }
+              
+              const senderName = insertedMessage.senderName || 'Someone';
+              
+              // Create in-app notification
+              if (recipientId) {
+                await createNotification(
+                  recipientId,
+                  'New Message',
+                  `You have a new message from ${senderName}${jobTitle ? ` about "${jobTitle}"` : ''}`,
+                  'info',
+                  jobId,
+                  null // Link will be handled by the frontend based on jobId
+                );
+              }
+              
+              if (recipientEmail) {
+                sendNewMessageEmail(recipientEmail, recipientName, senderName, jobTitle)
+                  .catch(err => console.error('Failed to send new message email:', err));
+              }
+            } catch (emailErr) {
+              console.error('Error sending new message email:', emailErr);
+            }
+          })();
+        } catch (err) {
+          console.error('❌ Failed to send message via WebSocket:', err);
+          socket.emit('message_error', { error: 'Failed to send message' });
+        }
+      });
+
+      // Typing indicators
+      socket.on('typing:start', (data) => {
+        io.to(`user_${data.recipientId}`).emit('user_typing', { userId: data.senderId, typing: true });
+      });
+
+      socket.on('typing:stop', (data) => {
+        io.to(`user_${data.recipientId}`).emit('user_typing', { userId: data.senderId, typing: false });
+      });
+
+      // Mark messages as read
+      socket.on('message:read', async (data) => {
+        const { conversationId, userId, senderId } = data;
+        if (!conversationId || !userId || !senderId) {
+          return;
+        }
+        try {
+          await messagesCollection.updateMany(
+            {
+              conversationId,
+              recipientId: userId,
+              senderId: senderId, // Only mark messages from this sender as read
+              read: false
+            },
+            {
+              $set: { read: true, readAt: new Date() }
+            }
+          );
+          // Optionally emit a 'messages_read' event to update sender's UI
+          io.to(`user_${senderId}`).emit('messages_read', { conversationId, readerId: userId });
+        } catch (err) {
+          console.error('❌ Failed to mark messages as read via WebSocket:', err);
+        }
+      });
+
+      socket.on('disconnect', () => {
+        console.log('🔌 Client disconnected:', socket.id);
+      });
+    });
+
     // ---------- error handlers (must be after routes) ----------
 
     // 404 handler
@@ -1203,8 +2355,71 @@ async function startServer() {
 
     // ---------- Routes end ----------
 
-    app.listen(PORT, '0.0.0.0', () => {
+    // Schedule job expiration task (runs daily at midnight)
+    cron.schedule('0 0 * * *', async () => {
+      try {
+        console.log('🕐 Running scheduled job expiration task...');
+        const now = new Date();
+        
+        // Find jobs that have expired
+        const expiredJobs = await browseJobsCollection.find({
+          expiresAt: { $lte: now },
+          status: { $nin: ['completed', 'cancelled'] },
+          autoCloseEnabled: true,
+        }).toArray();
+
+        if (expiredJobs.length > 0) {
+          console.log(`📅 Found ${expiredJobs.length} expired job(s) to close`);
+          
+          for (const job of expiredJobs) {
+            // Update job status to completed
+            await browseJobsCollection.updateOne(
+              { _id: job._id },
+              { $set: { status: 'completed', updatedAt: new Date() } }
+            );
+
+            // Create notification for job owner
+            if (job.clientId) {
+              await createNotification(
+                job.clientId,
+                'Job Expired',
+                `Your job "${job.title || 'Untitled Job'}" has expired and has been automatically closed.`,
+                'info',
+                `/My-Posted-Job-Details/${job._id}`,
+                job._id.toString()
+              );
+
+              // Send email notification
+              try {
+                const clientUser = await usersCollection.findOne({ uid: job.clientId });
+                if (clientUser && clientUser.email) {
+                  await sendJobStatusEmail(
+                    clientUser.email,
+                    clientUser.displayName || 'Client',
+                    job.title || 'Your Job',
+                    'completed',
+                    'expired'
+                  );
+                }
+              } catch (emailErr) {
+                console.error('Failed to send expiration email:', emailErr);
+              }
+            }
+
+            console.log(`✅ Expired job "${job.title || job._id}" has been closed`);
+          }
+        } else {
+          console.log('✅ No expired jobs found');
+        }
+      } catch (err) {
+        console.error('❌ Error in job expiration task:', err);
+      }
+    });
+
+    server.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on http://localhost:${PORT}`);
+      console.log(`⚡ WebSocket server running on ws://localhost:${PORT}`);
+      console.log(`⏰ Job expiration task scheduled (runs daily at midnight)`);
     });
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err);
