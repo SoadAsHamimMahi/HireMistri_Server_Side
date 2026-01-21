@@ -40,6 +40,35 @@ app.use((req, _res, next) => {
   next();
 });
 
+// Track lastActiveAt for authenticated users
+app.use(async (req, res, next) => {
+  // Extract uid from common patterns: /api/users/:uid, /api/auth/sync body, etc.
+  let uid = null;
+  if (req.params?.uid) {
+    uid = req.params.uid;
+  } else if (req.body?.uid) {
+    uid = req.body.uid;
+  } else if (req.query?.uid) {
+    uid = req.query.uid;
+  }
+  
+  // Update lastActiveAt if we have a uid and usersCollection is ready
+  if (uid && usersCollection) {
+    try {
+      await usersCollection.updateOne(
+        { uid: String(uid) },
+        { $set: { lastActiveAt: new Date() } },
+        { upsert: false } // Don't create if doesn't exist
+      );
+    } catch (e) {
+      // Silently fail - don't block request
+      console.warn('Failed to update lastActiveAt:', e.message);
+    }
+  }
+  
+  next();
+});
+
 // -------- Uploads folder ----------
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -238,6 +267,130 @@ async function startServer() {
       return out;
     }
 
+    // Compute profile stats used by both client + worker UIs
+    // NOTE: Reviews are not implemented yet, so rating fields default to 0.
+    async function computeUserStats(uid) {
+      const safeUid = String(uid || '').trim();
+      if (!safeUid) return null;
+
+      // Get user role to compute role-specific stats
+      const userDoc = await usersCollection.findOne({ uid: safeUid }).catch(() => null);
+      const userRole = userDoc?.role || 'worker';
+
+      const [
+        jobsPostedBrowse,
+        jobsPostedLegacy,
+        appsAsWorker,
+        appsAsClient,
+        jobsAsClient,
+      ] = await Promise.all([
+        browseJobsCollection.countDocuments({ clientId: safeUid }),
+        // legacy jobs collection (may be unused in most flows)
+        jobsCollection.countDocuments({ clientId: safeUid }).catch(() => 0),
+        applicationsCollection
+          .find({ workerId: safeUid })
+          .project({ status: 1, createdAt: 1, updatedAt: 1, acceptedAt: 1, completedAt: 1 })
+          .toArray(),
+        applicationsCollection
+          .find({ clientId: safeUid })
+          .project({ status: 1, createdAt: 1, updatedAt: 1, jobId: 1 })
+          .toArray(),
+        browseJobsCollection
+          .find({ clientId: safeUid })
+          .project({ status: 1, createdAt: 1, updatedAt: 1, _id: 1 })
+          .toArray(),
+      ]);
+
+      const normStatus = (s) => String(s || '').toLowerCase();
+
+      // Worker stats
+      const workerStatusCounts = (appsAsWorker || []).reduce((acc, a) => {
+        const st = normStatus(a.status || 'pending') || 'pending';
+        acc[st] = (acc[st] || 0) + 1;
+        return acc;
+      }, {});
+
+      const workerApplicationsTotal = (appsAsWorker || []).length;
+      const workerAccepted = workerStatusCounts.accepted || 0;
+      const workerCompleted = workerStatusCounts.completed || 0;
+
+      // Calculate worker response time (time from application creation to acceptance)
+      const acceptedApps = (appsAsWorker || []).filter(a => normStatus(a.status) === 'accepted');
+      let workerResponseTimeHours = null;
+      if (acceptedApps.length > 0) {
+        const responseTimes = acceptedApps
+          .map(a => {
+            const created = a.createdAt ? new Date(a.createdAt) : null;
+            const accepted = a.acceptedAt ? new Date(a.acceptedAt) : (a.updatedAt ? new Date(a.updatedAt) : null);
+            if (created && accepted && accepted > created) {
+              return (accepted - created) / (1000 * 60 * 60); // hours
+            }
+            return null;
+          })
+          .filter(t => t !== null);
+        if (responseTimes.length > 0) {
+          const avg = responseTimes.reduce((sum, t) => sum + t, 0) / responseTimes.length;
+          workerResponseTimeHours = Math.round(avg * 10) / 10; // Round to 1 decimal
+        }
+      }
+
+      // Client stats
+      const totalJobsPosted = Number(jobsPostedBrowse || 0) + Number(jobsPostedLegacy || 0);
+      const jobsStatusCounts = (jobsAsClient || []).reduce((acc, j) => {
+        const st = normStatus(j.status || 'active') || 'active';
+        acc[st] = (acc[st] || 0) + 1;
+        return acc;
+      }, {});
+
+      const jobsCompleted = jobsStatusCounts.completed || 0;
+      const jobsCancelled = jobsStatusCounts.cancelled || 0;
+      const totalJobsWithStatus = totalJobsPosted || 1; // Avoid division by zero
+      const clientCancellationRate = totalJobsPosted > 0
+        ? Math.min(100, Math.round((jobsCancelled / totalJobsPosted) * 100))
+        : 0;
+
+      // Client hire rate: accepted applications / total applications received
+      const appsAsClientTotal = (appsAsClient || []).length;
+      const appsAccepted = (appsAsClient || []).filter(a => normStatus(a.status) === 'accepted').length;
+      const clientHireRate = appsAsClientTotal > 0
+        ? Math.min(100, Math.round((appsAccepted / appsAsClientTotal) * 100))
+        : 0;
+
+      // Base stats (shared)
+      const baseStats = {
+        totalJobsPosted,
+        averageRating: 0, // placeholder until reviews exist
+      };
+
+      // Role-specific stats
+      if (userRole === 'worker') {
+        return {
+          ...baseStats,
+          // Worker-facing
+          applicationsAsWorker: workerApplicationsTotal,
+          workerStatusCounts,
+          workerActiveOrders: workerAccepted,
+          workerCompletedJobs: workerCompleted,
+          workerResponseRate: workerApplicationsTotal > 0
+            ? Math.min(100, Math.round((workerAccepted / workerApplicationsTotal) * 100))
+            : 0,
+          workerResponseTimeHours,
+          // On-time rate requires dueDate/completedAt on jobs - placeholder for now
+          workerOnTimeRate: null,
+        };
+      } else {
+        // Client-facing
+        return {
+          ...baseStats,
+          applicationsAsClient: appsAsClientTotal,
+          clientJobsCompleted: jobsCompleted,
+          clientHireRate,
+          clientCancellationRate,
+          clientNoShowRate: 0, // Requires explicit tracking - placeholder
+        };
+      }
+    }
+
     // ---------- Routes start ----------
 
     app.get('/', (_req, res) => {
@@ -252,18 +405,94 @@ async function startServer() {
         const uid = String(req.params.uid);
         const doc = await usersCollection.findOne({ uid });
         if (!doc) return res.status(404).json({ error: 'User not found' });
-        res.json(doc);
+        const stats = await computeUserStats(uid);
+        res.json({
+          ...doc,
+          // Backward compatible fields used by existing UIs
+          totalJobsPosted: stats?.totalJobsPosted || 0,
+          averageRating: stats?.averageRating || 0,
+          // New structured stats object
+          stats: stats || {},
+        });
       } catch (err) {
         console.error('GET /api/users/:uid failed:', err);
         res.status(500).json({ error: 'Failed to fetch user' });
       }
     });
 
+    // Public profile: safe fields only + computed stats
+    app.get('/api/users/:uid/public', async (req, res) => {
+      try {
+        const uid = String(req.params.uid || '').trim();
+        if (!uid) return res.status(400).json({ error: 'Missing uid' });
+
+        const doc = await usersCollection.findOne({ uid });
+        if (!doc) return res.status(404).json({ error: 'User not found' });
+
+        const stats = await computeUserStats(uid);
+
+        const publicDoc = {
+          uid: doc.uid,
+          role: doc.role || 'user',
+          displayName:
+            doc.displayName ||
+            [doc.firstName, doc.lastName].filter(Boolean).join(' ').trim() ||
+            'User',
+          firstName: doc.firstName || '',
+          lastName: doc.lastName || '',
+          headline: doc.headline || '',
+          bio: doc.bio || '',
+          skills: Array.isArray(doc.skills) ? doc.skills : [],
+          isAvailable: !!doc.isAvailable,
+          profileCover: doc.profileCover || '',
+          // Location: only city/country (privacy-safe)
+          city: doc.city || '',
+          country: doc.country || '',
+          // Verification badges (public-safe)
+          emailVerified: !!doc.emailVerified,
+          phoneVerified: !!doc.phoneVerified,
+          // Account transparency
+          createdAt: doc.createdAt || null,
+          updatedAt: doc.updatedAt || null,
+          lastActiveAt: doc.lastActiveAt || null,
+          // Worker-specific public fields
+          ...(doc.role === 'worker' ? {
+            servicesOffered: doc.servicesOffered || null,
+            serviceArea: doc.serviceArea || null,
+            experienceYears: doc.experienceYears || doc.workExperience || null,
+            languages: Array.isArray(doc.languages) ? doc.languages : [],
+            pricing: doc.pricing || null,
+            portfolio: Array.isArray(doc.portfolio) ? doc.portfolio : [],
+            certifications: Array.isArray(doc.certifications) ? doc.certifications : [],
+          } : {}),
+          // Client-specific public fields
+          ...(doc.role === 'client' ? {
+            preferences: doc.preferences || null,
+          } : {}),
+          // Backward compatible fields (public-safe)
+          totalJobsPosted: stats?.totalJobsPosted || 0,
+          averageRating: stats?.averageRating || 0,
+          // New structured stats object
+          stats: stats || {},
+        };
+
+        res.json(publicDoc);
+      } catch (err) {
+        console.error('GET /api/users/:uid/public failed:', err);
+        res.status(500).json({ error: 'Failed to fetch public profile' });
+      }
+    });
+
     // First-login sync: only create if missing (no destructive $set)
     app.post('/api/auth/sync', async (req, res) => {
       try {
-        const { uid, email } = req.body || {};
+        const { uid, email, role } = req.body || {};
         if (!uid) return res.status(400).json({ error: 'uid required' });
+
+        // Validate role if provided
+        const validRole = role && ['worker', 'client'].includes(String(role).toLowerCase())
+          ? String(role).toLowerCase()
+          : 'worker'; // Default to worker for backward compatibility
 
         await usersCollection.updateOne(
           { uid: String(uid) },
@@ -271,7 +500,7 @@ async function startServer() {
             $setOnInsert: {
               uid: String(uid),
               createdAt: new Date(),
-              role: 'worker',
+              role: validRole,
               ...(email ? { email: String(email).toLowerCase().trim() } : {})
             }
           },
@@ -299,7 +528,14 @@ async function startServer() {
         const allowed = new Set([
           'firstName', 'lastName', 'displayName', 'phone', 'headline', 'bio',
           'skills', 'isAvailable', 'profileCover', 'address1', 'address2',
-          'city', 'country', 'zip', 'workExperience', 'role', 'email'
+          'city', 'country', 'zip', 'workExperience', 'role', 'email',
+          // New trust fields
+          'emailVerified', 'phoneVerified', 'lastActiveAt',
+          // Worker-specific fields
+          'servicesOffered', 'serviceArea', 'experienceYears', 'certifications',
+          'languages', 'pricing', 'portfolio',
+          // Client-specific fields
+          'preferences'
         ]);
 
         const existing = (await usersCollection.findOne({ uid })) || { uid, createdAt: now };
@@ -314,17 +550,30 @@ async function startServer() {
             ? vRaw.toLowerCase().trim()
             : vRaw;
 
-          if (k === 'skills' && Array.isArray(v)) {
-            const cleaned = v.map(s => String(s).trim()).filter(Boolean);
-            if (cleaned.length) $set[k] = cleaned;
+          // Handle arrays (skills, languages, portfolio, certifications)
+          if (Array.isArray(v)) {
+            if (k === 'skills' || k === 'languages') {
+              const cleaned = v.map(s => String(s).trim()).filter(Boolean);
+              if (cleaned.length) $set[k] = cleaned;
+            } else if (k === 'portfolio' || k === 'certifications') {
+              // Validate array of objects
+              if (v.length > 0 && v.every(item => typeof item === 'object')) {
+                $set[k] = v;
+              }
+            } else {
+              // Generic array handling
+              if (v.length) $set[k] = v;
+            }
             continue;
           }
 
+          // Handle booleans and numbers
           if (typeof v === 'boolean' || typeof v === 'number') {
             $set[k] = v;
             continue;
           }
 
+          // Handle strings
           if (typeof v === 'string') {
             const t = v.trim();
             if (t) $set[k] = t;
@@ -332,11 +581,13 @@ async function startServer() {
             continue;
           }
 
+          // Handle null
           if (v === null) {
             if (allowUnset && existing[k] !== undefined) $unset[k] = '';
             continue;
           }
 
+          // Handle objects (servicesOffered, serviceArea, pricing, preferences)
           if (v && typeof v === 'object') {
             if (Object.keys(v).length) $set[k] = v;
           }
