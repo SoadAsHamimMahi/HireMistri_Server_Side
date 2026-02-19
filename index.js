@@ -9,11 +9,61 @@ const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
 const cron = require('node-cron');
+// Task 1.5: In-memory rate limiter for job offer endpoints (no package required)
+const jobOfferRateLimitStore = new Map(); // key -> { count, resetAt }
+const JOB_OFFER_RATE_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const JOB_OFFER_RATE_MAX = 10; // max requests per window
+
+const jobOfferLimiter = (req, res, next) => {
+  const key = (req.ip || req.connection?.remoteAddress || 'unknown') + ':job-offers';
+  const now = Date.now();
+  let entry = jobOfferRateLimitStore.get(key);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + JOB_OFFER_RATE_WINDOW_MS };
+    jobOfferRateLimitStore.set(key, entry);
+  }
+  entry.count++;
+  if (entry.count > JOB_OFFER_RATE_MAX) {
+    return res.status(429).json({
+      error: 'Too many job offer requests. Please try again later.',
+      retryAfter: Math.ceil((entry.resetAt - now) / 1000)
+    });
+  }
+  next();
+};
+
+// Task 5.2: In-memory response cache for conversation jobs (no package required)
+const conversationJobsCache = new Map(); // key -> { data, expiresAt }
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function getCachedConversationJobs(conversationId) {
+  const key = `conversation_jobs:${conversationId}`;
+  const entry = conversationJobsCache.get(key);
+  if (!entry || Date.now() > entry.expiresAt) {
+    conversationJobsCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedConversationJobs(conversationId, data) {
+  conversationJobsCache.set(`conversation_jobs:${conversationId}`, {
+    data,
+    expiresAt: Date.now() + CACHE_TTL_MS
+  });
+}
+
+function invalidateConversationJobsCache(conversationId) {
+  if (conversationId) conversationJobsCache.delete(`conversation_jobs:${conversationId}`);
+}
 const {
   sendApplicationReceivedEmail,
   sendApplicationStatusEmail,
   sendJobStatusEmail,
   sendNewMessageEmail,
+  sendJobOfferEmail,
+  sendJobOfferReminderEmail,
+  sendJobOfferExpiredEmail,
 } = require('./utils/emailService');
 
 dotenv.config();
@@ -31,8 +81,7 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-
-
+// Task 1.5: Rate limiting applied to job-offer POST routes (see jobOfferLimiter above)
 
 // Simple request logger (useful while debugging)
 app.use((req, _res, next) => {
@@ -107,6 +156,53 @@ if (process.env.FIREBASE_CONFIG) {
   }
 }
 
+// Task 4.3: Authentication & Authorization Middleware
+const authenticateUser = async (req, res, next) => {
+  try {
+    if (!admin) {
+      // If Firebase Admin is not available, skip authentication
+      // In production, you should require authentication
+      return next();
+    }
+    
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    // Verify Firebase token
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = decodedToken;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+};
+
+const authorizeWorker = (req, res, next) => {
+  const { workerId } = req.body;
+  if (!req.user) {
+    // If authentication is skipped, allow the request
+    // In production, this should require authentication
+    return next();
+  }
+  
+  if (req.user.uid !== workerId) {
+    return res.status(403).json({ error: 'Unauthorized: workerId mismatch' });
+  }
+  next();
+};
+
+// Task 4.4: CSRF Protection
+// Note: csurf is deprecated. For modern Express apps, consider:
+// 1. Using express-session with csrf tokens
+// 2. Implementing SameSite cookie attributes
+// 3. Using double-submit cookie pattern
+// For now, CSRF protection is handled by:
+// - Same-origin policy (if CORS is properly configured)
+// - Authentication tokens in Authorization header
+// To add explicit CSRF protection, install: npm install csurf (deprecated) or use express-session
+
 // declare vars to assign after connect
 let db;
 let usersCollection;
@@ -115,6 +211,9 @@ let applicationsCollection;
 let browseJobsCollection;
 let notificationsCollection;
 let savedJobsCollection;
+let workerJobRequestsCollection;
+let jobOfferHistoryCollection; // Task 4.2: Audit trail collection
+let jobOfferRemindersCollection; // Task 6.1: Accept Later reminders
 
 async function startServer() {
   try {
@@ -129,6 +228,10 @@ async function startServer() {
     messagesCollection = db.collection('messages');
     notificationsCollection = db.collection('notifications');
     savedJobsCollection = db.collection('savedJobs');
+    reviewsCollection = db.collection('reviews');
+    workerJobRequestsCollection = db.collection('workerJobRequests');
+    jobOfferHistoryCollection = db.collection('jobOfferHistory'); // Task 4.2: Audit trail
+    jobOfferRemindersCollection = db.collection('jobOfferReminders'); // Task 6.1: Accept Later reminders
 
     // ---------- indexes ----------
     await usersCollection.createIndex({ uid: 1 }, { unique: true, sparse: true });
@@ -139,6 +242,13 @@ async function startServer() {
     await applicationsCollection.createIndex({ clientId: 1 });
     await applicationsCollection.createIndex({ workerEmail: 1 });
     await applicationsCollection.createIndex({ clientEmail: 1 });
+    
+    // Task 4.2: Create index for job offer history
+    await jobOfferHistoryCollection.createIndex({ jobId: 1, createdAt: -1 });
+    
+    // Task 6.1: Create index for job offer reminders
+    await jobOfferRemindersCollection.createIndex({ jobId: 1, workerId: 1 });
+    await jobOfferRemindersCollection.createIndex({ reminderAt: 1 });
     // prevent duplicate apply by the same worker to the same job
     await applicationsCollection.createIndex(
       { jobId: 1, workerId: 1 },
@@ -158,6 +268,21 @@ async function startServer() {
     // Saved Jobs indexes
     await savedJobsCollection.createIndex({ userId: 1, jobId: 1 }, { unique: true });
     await savedJobsCollection.createIndex({ userId: 1, savedAt: -1 });
+
+    // Reviews indexes
+    await reviewsCollection.createIndex({ workerId: 1, createdAt: -1 });
+    await reviewsCollection.createIndex({ jobId: 1 });
+    await reviewsCollection.createIndex({ applicationId: 1 }, { unique: true, sparse: true });
+    await reviewsCollection.createIndex({ clientId: 1, workerId: 1 });
+
+    // BrowseJobs indexes for private jobs
+    await browseJobsCollection.createIndex({ conversationId: 1 });
+    await browseJobsCollection.createIndex({ targetWorkerId: 1, isPrivate: 1 });
+
+    // Worker Job Requests indexes
+    await workerJobRequestsCollection.createIndex({ conversationId: 1 });
+    await workerJobRequestsCollection.createIndex({ workerId: 1, status: 1 });
+    await workerJobRequestsCollection.createIndex({ clientId: 1, status: 1 });
 
     // ---------- helpers ----------
     function pruneEmpty(obj) {
@@ -195,6 +320,127 @@ async function startServer() {
         return insertedNotification;
       } catch (err) {
         console.error('❌ Failed to create notification:', err);
+        return null;
+      }
+    }
+
+    // Helper function to get status emoji
+    function getStatusEmoji(status) {
+      const statusLower = String(status || '').toLowerCase();
+      const emojiMap = {
+        'completed': '✅',
+        'cancelled': '❌',
+        'on-hold': '⏸️',
+        'active': '📋',
+        'pending': '⏳',
+        'accepted': '✅',
+        'rejected': '❌',
+        'expired': '⏰'
+      };
+      return emojiMap[statusLower] || '📋';
+    }
+
+    // Helper function to find or create conversationId
+    async function findOrCreateConversationId(jobId, clientId, workerId) {
+      try {
+        if (!clientId || !workerId) {
+          return null;
+        }
+
+        // Sort IDs alphabetically for consistency
+        const sortedIds = [String(clientId), String(workerId)].sort();
+        
+        // Generate conversationId format
+        let conversationId;
+        if (jobId && ObjectId.isValid(jobId)) {
+          conversationId = `${String(jobId)}_${sortedIds.join('_')}`;
+        } else {
+          conversationId = sortedIds.join('_');
+        }
+
+        // Check if conversation already exists in messages collection
+        const existingConversation = await messagesCollection.findOne({
+          conversationId: conversationId
+        });
+
+        if (existingConversation) {
+          return conversationId;
+        }
+
+        // If no existing conversation, return the generated ID
+        // The conversation will be created when the first message is sent
+        return conversationId;
+      } catch (err) {
+        console.error('❌ Failed to find or create conversationId:', err);
+        return null;
+      }
+    }
+
+    // Helper function to send system messages
+    async function sendSystemMessage(conversationId, senderId, recipientId, jobId, message, options = {}) {
+      try {
+        // If conversationId not provided, try to generate it
+        if (!conversationId && jobId && senderId && recipientId) {
+          // Determine clientId and workerId based on context
+          // For most cases, senderId is clientId and recipientId is workerId
+          // But we need to check the job to be sure
+          let clientId = senderId;
+          let workerId = recipientId;
+          
+          if (jobId && ObjectId.isValid(jobId)) {
+            const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+            if (jobDoc) {
+              // Use job's clientId if available
+              if (jobDoc.clientId) {
+                clientId = String(jobDoc.clientId);
+                // If senderId matches clientId, recipientId is workerId, otherwise swap
+                if (String(senderId) !== clientId) {
+                  workerId = String(senderId);
+                } else {
+                  workerId = String(recipientId);
+                }
+              }
+            }
+          }
+          
+          conversationId = await findOrCreateConversationId(jobId, clientId, workerId);
+        }
+
+        if (!conversationId) {
+          console.warn('⚠️ Cannot send system message: missing conversationId');
+          return null;
+        }
+
+        if (!senderId || !recipientId) {
+          console.warn('⚠️ Cannot send system message: missing senderId or recipientId');
+          return null;
+        }
+
+        const systemMessage = {
+          conversationId: String(conversationId),
+          senderId: String(senderId),
+          recipientId: String(recipientId),
+          jobId: jobId ? String(jobId) : null,
+          message: String(message),
+          senderName: 'System',
+          recipientName: '',
+          read: false,
+          createdAt: new Date(),
+          isSystemMessage: true
+        };
+
+        const result = await messagesCollection.insertOne(systemMessage);
+        const insertedMessage = await messagesCollection.findOne({ _id: result.insertedId });
+
+        // Emit WebSocket events to all relevant rooms
+        io.to(`user_${senderId}`).emit('new_message', insertedMessage);
+        io.to(`user_${recipientId}`).emit('new_message', insertedMessage);
+        io.to(conversationId).emit('new_message', insertedMessage);
+
+        return insertedMessage;
+      } catch (err) {
+        console.error('❌ Failed to send system message:', err);
+        // Don't throw - system messages should not fail parent operations
         return null;
       }
     }
@@ -356,16 +602,75 @@ async function startServer() {
         ? Math.min(100, Math.round((appsAccepted / appsAsClientTotal) * 100))
         : 0;
 
+      // Calculate average rating from reviews (for workers)
+      let averageRating = 0;
+      let categoryRatings = {
+        qualityOfWork: 0,
+        punctuality: 0,
+        communication: 0,
+        professionalism: 0,
+        valueForMoney: 0,
+        cleanliness: 0,
+      };
+      
+      if (userRole === 'worker') {
+        const reviews = await reviewsCollection.find({ workerId: safeUid }).toArray();
+        if (reviews.length > 0) {
+          // Calculate average overall rating
+          const totalRating = reviews.reduce((sum, r) => sum + (r.overallRating || 0), 0);
+          averageRating = Math.round((totalRating / reviews.length) * 10) / 10; // Round to 1 decimal
+          
+          // Calculate average ratings by category
+          const categoryTotals = {
+            qualityOfWork: 0,
+            punctuality: 0,
+            communication: 0,
+            professionalism: 0,
+            valueForMoney: 0,
+            cleanliness: 0,
+          };
+          
+          reviews.forEach(review => {
+            if (review.ratings) {
+              Object.keys(categoryTotals).forEach(category => {
+                if (review.ratings[category]) {
+                  categoryTotals[category] += review.ratings[category];
+                }
+              });
+            }
+          });
+          
+          Object.keys(categoryTotals).forEach(category => {
+            categoryRatings[category] = Math.round((categoryTotals[category] / reviews.length) * 10) / 10;
+          });
+        }
+      }
+
       // Base stats (shared)
       const baseStats = {
         totalJobsPosted,
-        averageRating: 0, // placeholder until reviews exist
+        averageRating,
+        categoryRatings: userRole === 'worker' ? categoryRatings : null,
+        totalReviews: userRole === 'worker' ? await reviewsCollection.countDocuments({ workerId: safeUid }) : 0,
       };
+
+      // Client stats (include when user has posted jobs, regardless of role)
+      const clientStatsWhenPosted =
+        totalJobsPosted > 0
+          ? {
+              applicationsAsClient: appsAsClientTotal,
+              clientJobsCompleted: jobsCompleted,
+              clientHireRate,
+              clientCancellationRate,
+              clientNoShowRate: 0,
+            }
+          : {};
 
       // Role-specific stats
       if (userRole === 'worker') {
         return {
           ...baseStats,
+          ...clientStatsWhenPosted,
           // Worker-facing
           applicationsAsWorker: workerApplicationsTotal,
           workerStatusCounts,
@@ -445,6 +750,10 @@ async function startServer() {
           skills: Array.isArray(doc.skills) ? doc.skills : [],
           isAvailable: !!doc.isAvailable,
           profileCover: doc.profileCover || '',
+          // Email (public-safe - email is commonly shared in job contexts)
+          email: doc.email || '',
+          // Phone (public-safe - for direct call when messaging is paused)
+          phone: doc.phone || '',
           // Location: only city/country (privacy-safe)
           city: doc.city || '',
           country: doc.country || '',
@@ -480,6 +789,171 @@ async function startServer() {
       } catch (err) {
         console.error('GET /api/users/:uid/public failed:', err);
         res.status(500).json({ error: 'Failed to fetch public profile' });
+      }
+    });
+
+    // Browse workers endpoint - returns popular/featured workers
+    app.get('/api/browse-workers', async (req, res) => {
+      try {
+        const { limit = 9, sortBy = 'popular' } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 9, 50); // Max 50 workers
+        
+        // Find all workers
+        const workers = await usersCollection.find({ role: 'worker' }).toArray();
+        
+        // Compute stats for each worker and build response
+        const workersWithStats = await Promise.all(
+          workers.map(async (worker) => {
+            const stats = await computeUserStats(worker.uid);
+            return {
+              uid: worker.uid,
+              displayName: worker.displayName || 
+                [worker.firstName, worker.lastName].filter(Boolean).join(' ') || 
+                'Worker',
+              profileCover: worker.profileCover || '',
+              city: worker.city || '',
+              country: worker.country || '',
+              servicesOffered: worker.servicesOffered || { categories: [], tags: [] },
+              portfolio: Array.isArray(worker.portfolio) ? worker.portfolio : [],
+              pricing: worker.pricing || null,
+              stats: stats || {},
+              emailVerified: !!worker.emailVerified,
+              isAvailable: !!worker.isAvailable,
+            };
+          })
+        );
+        
+        // Calculate popularity score for each worker using weighted algorithm
+        // Formula: Popularity Score = (Completed Jobs × Weight) + (Rating × Weight) + (Response Rate × Weight) + Bonuses
+        function calculatePopularityScore(worker) {
+          const stats = worker.stats || {};
+          const completedJobs = stats.workerCompletedJobs || 0;
+          const rating = stats.averageRating || 0; // 0-5 scale
+          const responseRate = stats.workerResponseRate || 0; // 0-100 percentage
+          
+          // Base score: Completed jobs (most important factor)
+          // Each completed job = 10 points (shows experience and reliability)
+          const jobsScore = completedJobs * 10;
+          
+          // Rating score: Higher rating = more points
+          // Rating is 0-5, so multiply by 20 to make it significant
+          // Example: 4.5 rating = 90 points, 5.0 rating = 100 points
+          const ratingScore = rating * 20;
+          
+          // Response rate score: Shows reliability and engagement
+          // Response rate is 0-100%, multiply by 0.5 to add bonus points
+          // Example: 90% response rate = 45 bonus points
+          const responseRateScore = responseRate * 0.5;
+          
+          // Bonus points for verification and availability
+          let bonusPoints = 0;
+          if (worker.emailVerified) bonusPoints += 5; // Verified email = trust
+          if (worker.isAvailable) bonusPoints += 10; // Available = can work now
+          
+          // Total popularity score
+          const totalScore = jobsScore + ratingScore + responseRateScore + bonusPoints;
+          
+          return {
+            ...worker,
+            popularityScore: totalScore,
+            // Store breakdown for debugging/logging if needed
+            _scoreBreakdown: {
+              jobsScore,
+              ratingScore,
+              responseRateScore,
+              bonusPoints,
+              totalScore
+            }
+          };
+        }
+        
+        // Calculate scores for all workers
+        const workersWithScores = workersWithStats.map(calculatePopularityScore);
+        
+        // Sort by popularity score (highest first)
+        if (sortBy === 'popular') {
+          workersWithScores.sort((a, b) => {
+            // Primary sort: popularity score (descending)
+            if (b.popularityScore !== a.popularityScore) {
+              return b.popularityScore - a.popularityScore;
+            }
+            // Secondary sort: if scores are equal, prioritize higher completed jobs
+            const aJobs = a.stats?.workerCompletedJobs || 0;
+            const bJobs = b.stats?.workerCompletedJobs || 0;
+            if (bJobs !== aJobs) {
+              return bJobs - aJobs;
+            }
+            // Tertiary sort: if jobs are equal, prioritize higher rating
+            const aRating = a.stats?.averageRating || 0;
+            const bRating = b.stats?.averageRating || 0;
+            return bRating - aRating;
+          });
+        }
+        
+        // Limit results (remove score breakdown before sending to client)
+        const limited = workersWithScores.slice(0, limitNum).map(({ _scoreBreakdown, ...worker }) => worker);
+        
+        res.json(limited);
+      } catch (err) {
+        console.error('GET /api/browse-workers failed:', err);
+        res.status(500).json({ error: 'Failed to fetch workers' });
+      }
+    });
+
+    // Browse clients endpoint - returns clients for workers to browse
+    app.get('/api/browse-clients', async (req, res) => {
+      try {
+        const { limit = 9, sortBy = 'recent' } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 9, 50); // Max 50 clients
+        
+        // Find all clients
+        const clients = await usersCollection.find({ role: 'client' }).toArray();
+        
+        // Compute stats for each client and build response
+        const clientsWithStats = await Promise.all(
+          clients.map(async (client) => {
+            const stats = await computeUserStats(client.uid);
+            return {
+              uid: client.uid,
+              displayName: client.displayName || 
+                [client.firstName, client.lastName].filter(Boolean).join(' ') || 
+                'Client',
+              profileCover: client.profileCover || '',
+              city: client.city || '',
+              country: client.country || '',
+              email: client.email || '',
+              phone: client.phone || '',
+              stats: stats || {},
+              emailVerified: !!client.emailVerified,
+              phoneVerified: !!client.phoneVerified,
+              createdAt: client.createdAt || new Date(),
+            };
+          })
+        );
+        
+        // Sort clients
+        if (sortBy === 'recent') {
+          clientsWithStats.sort((a, b) => {
+            const aDate = new Date(a.createdAt || 0);
+            const bDate = new Date(b.createdAt || 0);
+            return bDate - aDate; // Most recent first
+          });
+        } else if (sortBy === 'jobs') {
+          // Sort by number of jobs posted
+          clientsWithStats.sort((a, b) => {
+            const aJobs = a.stats?.totalJobsPosted || 0;
+            const bJobs = b.stats?.totalJobsPosted || 0;
+            return bJobs - aJobs; // Most jobs first
+          });
+        }
+        
+        // Limit results
+        const limited = clientsWithStats.slice(0, limitNum);
+        
+        res.json(limited);
+      } catch (err) {
+        console.error('GET /api/browse-clients failed:', err);
+        res.status(500).json({ error: 'Failed to fetch clients' });
       }
     });
 
@@ -605,6 +1079,19 @@ async function startServer() {
 
         await usersCollection.updateOne({ uid }, updateDoc, { upsert: true });
         const doc = await usersCollection.findOne({ uid });
+
+        // When name fields change, propagate to applications so workerName stays in sync
+        const nameChanged = ['displayName', 'firstName', 'lastName'].some(k => $set[k] !== undefined);
+        if (nameChanged) {
+          const newName = (doc.displayName || [doc.firstName, doc.lastName].filter(Boolean).join(' ').trim() || '').trim();
+          if (newName) {
+            await applicationsCollection.updateMany(
+              { workerId: uid },
+              { $set: { workerName: newName, updatedAt: now } }
+            ).catch(() => {});
+          }
+        }
+
         return res.json(doc);
       } catch (err) {
         console.error('PATCH /api/users/:uid failed:', err);
@@ -707,12 +1194,16 @@ async function startServer() {
         const existing = await applicationsCollection.findOne({ jobId, workerId });
         const isNew = !existing;
 
-        // Validation: If updating existing application, only allow if status is "pending"
+        // Validation: If updating existing application, allow when pending or when accepted but only updating price negotiation (finalPrice/counterPrice/negotiationStatus)
         if (!isNew && existing) {
           const currentStatus = (existing.status || 'pending').toLowerCase();
-          if (currentStatus !== 'pending') {
+          const isPriceUpdateOnly = [b.finalPrice, b.counterPrice, b.negotiationStatus].some(
+            (v) => v !== undefined && v !== null
+          ) && !b.status && !b.proposalText && !('text' in b) && !('proposalText' in b);
+          const allowed = currentStatus === 'pending' || (currentStatus === 'accepted' && isPriceUpdateOnly);
+          if (!allowed) {
             return res.status(400).json({ 
-              error: 'Cannot edit application. Only pending applications can be edited.' 
+              error: 'Cannot edit application. Only pending applications can be edited, or you can update price negotiation on an accepted application.' 
             });
           }
           // Verify ownership
@@ -749,6 +1240,11 @@ async function startServer() {
         const $set = { updatedAt: now };
         const $setOnInsert = { jobId, workerId, createdAt: now, status: 'pending' };
 
+        // helper to avoid writing same key in both operators
+        const setIf = (k, v) => {
+          if (v || v === 0 || v === false) (isNew ? $setOnInsert : $set)[k] = v;
+        };
+
         // optional status & proposalText
         if ('status' in b) {
           (isNew ? $setOnInsert : $set).status = s(b.status);
@@ -757,11 +1253,38 @@ async function startServer() {
           const val = s(b.proposalText || b.text);
           (isNew ? $setOnInsert : $set).proposalText = val;
         }
-
-        // helper to avoid writing same key in both operators
-        const setIf = (k, v) => {
-          if (v || v === 0 || v === false) (isNew ? $setOnInsert : $set)[k] = v;
-        };
+        
+        // Price bargaining fields
+        if ('proposedPrice' in b) {
+          const price = parseFloat(b.proposedPrice);
+          if (!isNaN(price) && price > 0) {
+            setIf('proposedPrice', price);
+            // Set negotiation status if not already set
+            if (!existing?.negotiationStatus || existing.negotiationStatus === 'none') {
+              setIf('negotiationStatus', 'pending');
+            }
+          }
+        }
+        if ('counterPrice' in b) {
+          const price = parseFloat(b.counterPrice);
+          if (!isNaN(price) && price > 0) {
+            setIf('counterPrice', price);
+            setIf('negotiationStatus', 'countered');
+          }
+        }
+        if ('finalPrice' in b) {
+          const price = parseFloat(b.finalPrice);
+          if (!isNaN(price) && price > 0) {
+            setIf('finalPrice', price);
+            setIf('negotiationStatus', 'accepted');
+          }
+        }
+        if ('negotiationStatus' in b) {
+          const status = s(b.negotiationStatus);
+          if (['none', 'pending', 'countered', 'accepted', 'cancelled'].includes(status)) {
+            setIf('negotiationStatus', status);
+          }
+        }
 
         // client identity
         setIf('clientId', clientIdIn);
@@ -791,9 +1314,10 @@ async function startServer() {
             let jobTitle = 'Your Job';
             let clientEmail = doc.clientEmail;
             let clientName = 'Client';
+            let jobDoc = null;
             
             if (ObjectId.isValid(jobId)) {
-              const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+              jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
               if (jobDoc) {
                 jobTitle = jobDoc.title || jobTitle;
                 clientEmail = clientEmail || jobDoc.postedByEmail || jobDoc.email;
@@ -816,6 +1340,36 @@ async function startServer() {
               // Send email asynchronously (don't block response)
               sendApplicationReceivedEmail(clientEmail, clientName, jobTitle, workerName)
                 .catch(err => console.error('Failed to send application received email:', err));
+            }
+
+            // Send system message to chat if application is from chat
+            const conversationId = req.body.conversationId || jobDoc?.conversationId;
+            if (conversationId && doc.jobId && doc.clientId && doc.workerId) {
+              try {
+                const messageParts = [
+                  `📝 New application received: ${jobTitle}`,
+                  `👤 From: ${workerName}`
+                ];
+                
+                // Include proposal preview if available and short enough
+                if (doc.proposalText) {
+                  const proposalPreview = doc.proposalText.length > 100 
+                    ? `${doc.proposalText.substring(0, 100)}...`
+                    : doc.proposalText;
+                  messageParts.push(`\n💬 Proposal:\n${proposalPreview}`);
+                }
+                
+                await sendSystemMessage(
+                  String(conversationId),
+                  doc.workerId, // sender (worker applied)
+                  doc.clientId, // recipient
+                  doc.jobId,
+                  messageParts.join('\n')
+                );
+              } catch (msgErr) {
+                console.error('Failed to send system message for application:', msgErr);
+                // Don't fail the request if message fails
+              }
             }
           } catch (emailErr) {
             console.error('Error sending application received email:', emailErr);
@@ -1213,9 +1767,89 @@ async function startServer() {
               sendApplicationStatusEmail(workerEmail, workerName, jobTitle, statusIn)
                 .catch(err => console.error('Failed to send application status email:', err));
             }
+
+            // Send system message to chat
+            if (doc.jobId && doc.clientId && doc.workerId) {
+              const conversationId = await findOrCreateConversationId(doc.jobId, doc.clientId, doc.workerId);
+              const reason = req.body.reason || req.body.message || null;
+              
+              if (statusIn === 'accepted') {
+                // Get job details for a more informative message
+                let jobDetails = '';
+                try {
+                  const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(doc.jobId) });
+                  if (jobDoc) {
+                    jobDetails = `${jobDoc.budget ? `\n💰 Budget: ${jobDoc.budget} ${jobDoc.currency || 'BDT'}` : ''}${jobDoc.location ? `\n📍 Location: ${jobDoc.location}` : ''}`;
+                  }
+                } catch (jobErr) {
+                  console.error('Failed to fetch job details for message:', jobErr);
+                }
+                
+                const messageText = `✅ Congratulations! Your application has been accepted!\n\n📋 Job: ${jobTitle}${jobDetails}\n\n🎉 You can now start working on this job. Contact the client to coordinate the details.`;
+                
+                await sendSystemMessage(
+                  conversationId,
+                  doc.clientId, // sender (client made the decision)
+                  doc.workerId, // recipient
+                  doc.jobId,
+                  messageText
+                );
+              } else {
+                const messageText = `❌ Application rejected: ${jobTitle}${reason ? `\n\nReason: ${reason}` : ''}`;
+                
+                await sendSystemMessage(
+                  conversationId,
+                  doc.clientId, // sender (client made the decision)
+                  doc.workerId, // recipient
+                  doc.jobId,
+                  messageText
+                );
+              }
+            }
           } catch (emailErr) {
             console.error('Error sending application status email:', emailErr);
             // Don't fail the request if email fails
+          }
+        }
+
+        // Send system message when application is marked as completed
+        if (statusChanged && statusIn === 'completed') {
+          try {
+            // Get job details
+            let jobTitle = 'the job';
+            if (ObjectId.isValid(doc.jobId)) {
+              const jobDoc = await browseJobsCollection.findOne({ _id: new ObjectId(doc.jobId) });
+              if (jobDoc) {
+                jobTitle = jobDoc.title || jobTitle;
+              }
+            }
+
+            // Send system message to both client and worker
+            if (doc.jobId && doc.clientId && doc.workerId) {
+              const conversationId = await findOrCreateConversationId(doc.jobId, doc.clientId, doc.workerId);
+              const messageText = `🎉 Job completed: ${jobTitle}`;
+              
+              // Send to worker
+              await sendSystemMessage(
+                conversationId,
+                doc.clientId,
+                doc.workerId,
+                doc.jobId,
+                messageText
+              );
+              
+              // Send to client (reverse sender/recipient)
+              await sendSystemMessage(
+                conversationId,
+                doc.workerId,
+                doc.clientId,
+                doc.jobId,
+                messageText
+              );
+            }
+          } catch (completionErr) {
+            console.error('Error sending completion system message:', completionErr);
+            // Don't fail the request if message fails
           }
         }
         
@@ -1485,6 +2119,226 @@ async function startServer() {
 
 
 
+    // ===== REVIEWS =====
+    // Create a new review
+    app.post('/api/reviews', async (req, res) => {
+      try {
+        const {
+          jobId,
+          applicationId,
+          workerId,
+          clientId,
+          ratings,
+          overallRating,
+          reviewText
+        } = req.body || {};
+
+        // Validation
+        if (!jobId || !applicationId || !workerId || !clientId) {
+          return res.status(400).json({ error: 'Missing required fields: jobId, applicationId, workerId, clientId' });
+        }
+
+        if (!ratings || typeof ratings !== 'object') {
+          return res.status(400).json({ error: 'Ratings object is required' });
+        }
+
+        // Validate ratings (1-5 scale)
+        const validCategories = ['qualityOfWork', 'punctuality', 'communication', 'professionalism', 'valueForMoney', 'cleanliness'];
+        for (const category of validCategories) {
+          if (ratings[category] !== undefined) {
+            const rating = Number(ratings[category]);
+          if (rating > 0 && (isNaN(rating) || rating > 5)) {
+              return res.status(400).json({ error: `Rating for ${category} must be between 1 and 5` });
+            }
+          }
+        }
+
+        // Calculate overall rating if not provided (average of category ratings)
+        let calculatedOverallRating = overallRating;
+        if (!calculatedOverallRating) {
+          const ratingValues = Object.values(ratings).filter(v => typeof v === 'number' && v >= 1 && v <= 5);
+          if (ratingValues.length > 0) {
+            calculatedOverallRating = Math.round((ratingValues.reduce((sum, r) => sum + r, 0) / ratingValues.length) * 10) / 10;
+          } else {
+            return res.status(400).json({ error: 'At least one category rating is required' });
+          }
+        }
+
+        // Check if review already exists for this application
+        const existingReview = await reviewsCollection.findOne({ applicationId: String(applicationId) });
+        if (existingReview) {
+          return res.status(409).json({ error: 'Review already exists for this application' });
+        }
+
+        // Verify the application exists and is completed
+        let application;
+        if (ObjectId.isValid(applicationId)) {
+          application = await applicationsCollection.findOne({ _id: new ObjectId(applicationId) });
+        } else {
+          application = await applicationsCollection.findOne({ _id: applicationId });
+        }
+        
+        if (!application) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+
+        const appStatus = String(application.status || '').toLowerCase();
+        if (appStatus !== 'completed') {
+          return res.status(400).json({ error: 'Can only review completed applications' });
+        }
+
+        // Verify client owns the job
+        let job;
+        if (ObjectId.isValid(jobId)) {
+          job = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+        } else {
+          job = await browseJobsCollection.findOne({ _id: jobId });
+        }
+        
+        if (!job) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        if (String(job.clientId) !== String(clientId)) {
+          return res.status(403).json({ error: 'You can only review workers for your own jobs' });
+        }
+
+        // Create review document
+        const review = {
+          jobId: String(jobId),
+          applicationId: String(applicationId),
+          workerId: String(workerId),
+          clientId: String(clientId),
+          ratings: {
+            qualityOfWork: Number(ratings.qualityOfWork) || 0,
+            punctuality: Number(ratings.punctuality) || 0,
+            communication: Number(ratings.communication) || 0,
+            professionalism: Number(ratings.professionalism) || 0,
+            valueForMoney: Number(ratings.valueForMoney) || 0,
+            cleanliness: Number(ratings.cleanliness) || 0,
+          },
+          overallRating: calculatedOverallRating,
+          reviewText: String(reviewText || '').trim(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await reviewsCollection.insertOne(review);
+
+        // Update user stats cache by triggering recomputation (will happen on next request)
+        // For now, we'll let computeUserStats handle it on next fetch
+
+        // Send system message to worker about the review
+        try {
+          const conversationId = await findOrCreateConversationId(jobId, clientId, workerId);
+          if (conversationId) {
+            const jobTitleForMessage = job?.title || 'the job';
+            const messageParts = [
+              `⭐ Review received: ${jobTitleForMessage}`,
+              `📊 Rating: ${calculatedOverallRating}/5`
+            ];
+            
+            if (reviewText && reviewText.trim()) {
+              const reviewPreview = reviewText.trim().length > 150 
+                ? `${reviewText.trim().substring(0, 150)}...`
+                : reviewText.trim();
+              messageParts.push(`\n💬 Review:\n${reviewPreview}`);
+            }
+            
+            await sendSystemMessage(
+              conversationId,
+              clientId,
+              workerId,
+              jobId,
+              messageParts.join('\n')
+            );
+          }
+        } catch (msgErr) {
+          console.error('Failed to send system message for review:', msgErr);
+          // Don't fail the request if message fails
+        }
+
+        res.status(201).json({
+          success: true,
+          review: {
+            _id: result.insertedId,
+            ...review
+          }
+        });
+      } catch (err) {
+        console.error('POST /api/reviews failed:', err);
+        res.status(500).json({ error: 'Failed to create review' });
+      }
+    });
+
+    // Get reviews for a worker
+    app.get('/api/reviews/worker/:workerId', async (req, res) => {
+      try {
+        const { workerId } = req.params;
+        const { limit = 10, skip = 0 } = req.query;
+
+        const reviews = await reviewsCollection
+          .find({ workerId: String(workerId) })
+          .sort({ createdAt: -1 })
+          .limit(parseInt(limit) || 10)
+          .skip(parseInt(skip) || 0)
+          .toArray();
+
+        // Get client names for each review
+        const reviewsWithClientNames = await Promise.all(
+          reviews.map(async (review) => {
+            const client = await usersCollection.findOne({ uid: review.clientId });
+            return {
+              ...review,
+              clientName: client?.displayName || 
+                         [client?.firstName, client?.lastName].filter(Boolean).join(' ') ||
+                         'Anonymous',
+              clientAvatar: client?.profileCover || null,
+            };
+          })
+        );
+
+        res.json(reviewsWithClientNames);
+      } catch (err) {
+        console.error('GET /api/reviews/worker/:workerId failed:', err);
+        res.status(500).json({ error: 'Failed to fetch reviews' });
+      }
+    });
+
+    // Get review for a specific job/application
+    app.get('/api/reviews/job/:jobId', async (req, res) => {
+      try {
+        const { jobId } = req.params;
+        const review = await reviewsCollection.findOne({ jobId: String(jobId) });
+        
+        if (!review) {
+          return res.status(404).json({ error: 'Review not found' });
+        }
+
+        res.json(review);
+      } catch (err) {
+        console.error('GET /api/reviews/job/:jobId failed:', err);
+        res.status(500).json({ error: 'Failed to fetch review' });
+      }
+    });
+
+    // Get review by application ID
+    app.get('/api/reviews/application/:applicationId', async (req, res) => {
+      try {
+        const { applicationId } = req.params;
+        const review = await reviewsCollection.findOne({ applicationId: String(applicationId) });
+        
+        if (!review) {
+          return res.status(404).json({ error: 'Review not found' });
+        }
+
+        res.json(review);
+      } catch (err) {
+        console.error('GET /api/reviews/application/:applicationId failed:', err);
+        res.status(500).json({ error: 'Failed to fetch review' });
+      }
+    });
+
     // ===== BROWSE JOBS =====
     app.get('/api/browse-jobs', async (req, res) => {
       try {
@@ -1524,16 +2378,57 @@ async function startServer() {
           filter.status = { $ne: 'completed' };
         }
 
-        // Skills filter (comma-separated, matches any)
+        // Skills filter (comma-separated, matches any) - Build this first
+        let skillsFilter = null;
         if (skills) {
           const skillsArray = String(skills).split(',').map(s => s.trim()).filter(Boolean);
           if (skillsArray.length > 0) {
-            // Match if job skills array contains any of the requested skills (case-insensitive)
-            filter.$or = filter.$or || [];
-            filter.$or.push({
+            skillsFilter = {
               skills: { $in: skillsArray.map(s => new RegExp(s, 'i')) }
-            });
+            };
           }
+        }
+
+        // Private job filtering - Apply AFTER other filters to ensure correct exclusion
+        const includePrivate = req.query.includePrivate === 'true';
+        const conversationId = req.query.conversationId;
+        const targetWorkerId = req.query.targetWorkerId;
+        
+        // Build private job filter condition
+        let privateJobCondition = null;
+        if (conversationId) {
+          // Include private jobs for this conversation OR public jobs
+          privateJobCondition = {
+            $or: [
+              { conversationId: String(conversationId), isPrivate: true },
+              { isPrivate: { $ne: true } }
+            ]
+          };
+        } else if (targetWorkerId) {
+          // Include private jobs targeted to this worker OR public jobs
+          privateJobCondition = {
+            $or: [
+              { targetWorkerId: String(targetWorkerId), isPrivate: true },
+              { isPrivate: { $ne: true } }
+            ]
+          };
+        } else if (!includePrivate) {
+          // Exclude private jobs from public listings
+          filter.isPrivate = { $ne: true };
+        }
+
+        // Combine skills filter and private job condition using $and if both exist
+        if (skillsFilter && privateJobCondition) {
+          filter.$and = [
+            skillsFilter,
+            privateJobCondition
+          ];
+        } else if (skillsFilter) {
+          // Only skills filter exists
+          filter.$or = [skillsFilter];
+        } else if (privateJobCondition) {
+          // Only private job condition exists
+          Object.assign(filter, privateJobCondition);
         }
 
         // Date range filter
@@ -1626,6 +2521,878 @@ async function startServer() {
       } catch (err) {
         console.error('GET /api/browse-jobs failed:', err);
         res.status(500).json({ error: 'Failed to fetch browse jobs' });
+      }
+    });
+
+    // Get all jobs for a specific conversation (both client-created jobs and worker job requests)
+    // Task 5.2: Response cache - check cache first
+    app.get('/api/conversations/:conversationId/jobs', async (req, res) => {
+      try {
+        const { conversationId } = req.params;
+        if (!conversationId) {
+          return res.status(400).json({ error: 'conversationId is required' });
+        }
+
+        const cached = getCachedConversationJobs(conversationId);
+        if (cached) {
+          return res.json(cached);
+        }
+
+        // Fetch regular jobs for this conversation
+        const jobs = await browseJobsCollection.find({
+          conversationId: String(conversationId)
+        }).toArray();
+
+        // Fetch worker job requests for this conversation
+        const workerRequests = await workerJobRequestsCollection.find({
+          conversationId: String(conversationId)
+        }).toArray();
+
+        // Format worker requests to match job structure for consistent frontend handling
+        const formattedRequests = workerRequests.map(req => ({
+          _id: req._id,
+          type: 'workerRequest',
+          title: req.title,
+          description: req.description,
+          category: req.category,
+          proposedPrice: req.proposedPrice,
+          currency: req.currency || 'BDT',
+          location: req.location,
+          status: req.status,
+          workerId: req.workerId,
+          clientId: req.clientId,
+          conversationId: req.conversationId,
+          createdAt: req.createdAt,
+          updatedAt: req.updatedAt
+        }));
+
+        // Combine and return; Task 5.2: cache response
+        const payload = {
+          jobs: jobs,
+          workerRequests: formattedRequests,
+          all: [...jobs, ...formattedRequests]
+        };
+        setCachedConversationJobs(conversationId, payload);
+        res.json(payload);
+      } catch (err) {
+        console.error('GET /api/conversations/:conversationId/jobs failed:', err);
+        res.status(500).json({ error: 'Failed to fetch conversation jobs' });
+      }
+    });
+
+    // ===== WORKER JOB REQUESTS =====
+
+    // Create a worker job request
+    app.post('/api/worker-job-requests', async (req, res) => {
+      try {
+        const {
+          workerId,
+          clientId,
+          conversationId,
+          title,
+          description,
+          category,
+          proposedPrice,
+          currency,
+          location
+        } = req.body;
+
+        // Validation
+        if (!workerId || !clientId || !conversationId || !title || !description || !category) {
+          return res.status(400).json({ 
+            error: 'workerId, clientId, conversationId, title, description, and category are required' 
+          });
+        }
+
+        const requestDoc = {
+          workerId: String(workerId),
+          clientId: String(clientId),
+          conversationId: String(conversationId),
+          title: String(title).trim(),
+          description: String(description).trim(),
+          category: String(category),
+          proposedPrice: proposedPrice ? parseFloat(proposedPrice) : null,
+          currency: currency || 'BDT',
+          location: location ? String(location).trim() : null,
+          status: 'pending',
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const result = await workerJobRequestsCollection.insertOne(requestDoc);
+        const insertedRequest = await workerJobRequestsCollection.findOne({ _id: result.insertedId });
+
+        // Send system message to client about new job request
+        try {
+          const messageParts = [`💼 New job request: ${String(title).trim()}`];
+          if (proposedPrice) {
+            messageParts.push(`💰 Proposed Price: ${proposedPrice} ${currency || 'BDT'}`);
+          }
+          if (location) {
+            messageParts.push(`📍 Location: ${String(location).trim()}`);
+          }
+          
+          await sendSystemMessage(
+            String(conversationId),
+            String(workerId), // sender (worker created the request)
+            String(clientId), // recipient
+            null, // no jobId for worker job requests
+            messageParts.join('\n')
+          );
+        } catch (msgErr) {
+          console.error('Failed to send system message for worker job request:', msgErr);
+          // Don't fail the request if message fails
+        }
+
+        res.status(201).json({
+          success: true,
+          requestId: result.insertedId,
+          request: insertedRequest
+        });
+      } catch (err) {
+        console.error('POST /api/worker-job-requests failed:', err);
+        res.status(500).json({ error: 'Failed to create worker job request' });
+      }
+    });
+
+    // Get worker job requests
+    app.get('/api/worker-job-requests', async (req, res) => {
+      try {
+        const { conversationId, workerId, clientId, status } = req.query;
+        const filter = {};
+
+        if (conversationId) filter.conversationId = String(conversationId);
+        if (workerId) filter.workerId = String(workerId);
+        if (clientId) filter.clientId = String(clientId);
+        if (status) filter.status = String(status).toLowerCase();
+
+        const requests = await workerJobRequestsCollection.find(filter)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.json(requests);
+      } catch (err) {
+        console.error('GET /api/worker-job-requests failed:', err);
+        res.status(500).json({ error: 'Failed to fetch worker job requests' });
+      }
+    });
+
+    // Update worker job request status
+    app.patch('/api/worker-job-requests/:id/status', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid request ID' });
+        }
+
+        const allowedStatuses = ['pending', 'accepted', 'rejected', 'expired'];
+        if (!status || !allowedStatuses.includes(status.toLowerCase())) {
+          return res.status(400).json({ 
+            error: `Invalid status. Allowed: ${allowedStatuses.join(', ')}` 
+          });
+        }
+
+        const result = await workerJobRequestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              status: status.toLowerCase(),
+              updatedAt: new Date()
+            } 
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Worker job request not found' });
+        }
+
+        const updatedRequest = await workerJobRequestsCollection.findOne({ _id: new ObjectId(id) });
+        
+        // Send system message when status changes to accepted or rejected
+        if (updatedRequest && (status.toLowerCase() === 'accepted' || status.toLowerCase() === 'rejected')) {
+          try {
+            const messageText = status.toLowerCase() === 'accepted'
+              ? `✅ Job request accepted: ${updatedRequest.title}`
+              : `❌ Job request rejected: ${updatedRequest.title}`;
+            
+            await sendSystemMessage(
+              String(updatedRequest.conversationId),
+              String(updatedRequest.clientId), // sender (client made the decision)
+              String(updatedRequest.workerId), // recipient
+              null, // no jobId for worker job requests
+              messageText
+            );
+          } catch (msgErr) {
+            console.error('Failed to send system message for worker job request status change:', msgErr);
+            // Don't fail the request if message fails
+          }
+        }
+        
+        res.json(updatedRequest);
+      } catch (err) {
+        console.error('PATCH /api/worker-job-requests/:id/status failed:', err);
+        res.status(500).json({ error: 'Failed to update worker job request status' });
+      }
+    });
+
+    // ===== JOB OFFERS (Private Jobs Created from Chat) =====
+
+    // Accept a job offer (creates application automatically)
+    // Task 1.5: Rate limiting; Task 4.3: Auth middleware (skips when Firebase not configured)
+    app.post('/api/job-offers/:jobId/accept', jobOfferLimiter, authenticateUser, authorizeWorker, async (req, res) => {
+      try {
+        const { jobId } = req.params;
+        const { workerId } = req.body;
+
+        if (!ObjectId.isValid(jobId)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        if (!workerId) {
+          return res.status(400).json({ error: 'workerId is required' });
+        }
+
+        // Task 5.1: Optimize with aggregation - job + targetWorker in one query
+        const jobWithWorker = await browseJobsCollection.aggregate([
+          { $match: { _id: new ObjectId(jobId) } },
+          { $lookup: { from: 'users', localField: 'targetWorkerId', foreignField: 'uid', as: 'targetWorker' } },
+          { $addFields: { targetWorker: { $arrayElemAt: ['$targetWorker', 0] } } },
+          { $project: { _id: 1, title: 1, clientId: 1, targetWorkerId: 1, isPrivate: 1, status: 1, expiresAt: 1, budget: 1, currency: 1, location: 1, conversationId: 1, offerStatus: 1, targetWorker: 1 } }
+        ]).toArray();
+        const row = jobWithWorker[0];
+        if (!row) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+        const job = { _id: row._id, title: row.title, clientId: row.clientId, targetWorkerId: row.targetWorkerId, isPrivate: row.isPrivate, status: row.status, expiresAt: row.expiresAt, budget: row.budget, currency: row.currency, location: row.location, conversationId: row.conversationId, offerStatus: row.offerStatus };
+        const workerFromLookup = row.targetWorker;
+
+        if (!job.isPrivate) {
+          return res.status(400).json({ error: 'This endpoint is only for private job offers' });
+        }
+
+        // Verify workerId matches targetWorkerId
+        if (job.targetWorkerId !== String(workerId)) {
+          return res.status(403).json({ error: 'You are not authorized to accept this job offer' });
+        }
+
+        // Check if job is still active
+        if (job.status !== 'active') {
+          return res.status(400).json({ 
+            error: `This job is no longer available. Current status: ${job.status}` 
+          });
+        }
+
+        // Task 1.1: Check expiration
+        const now = new Date();
+        if (job.expiresAt && new Date(job.expiresAt) <= now) {
+          return res.status(400).json({ 
+            error: 'This job offer has expired',
+            expired: true,
+            expiredAt: job.expiresAt
+          });
+        }
+
+        // Calculate time remaining for expiration
+        const timeRemaining = job.expiresAt ? 
+          Math.max(0, new Date(job.expiresAt) - now) : null;
+        const hoursRemaining = timeRemaining ? 
+          Math.floor(timeRemaining / (1000 * 60 * 60)) : null;
+        const isExpiringSoon = hoursRemaining !== null && hoursRemaining < 24;
+
+        // Check if application already exists
+        const existingApp = await applicationsCollection.findOne({
+          jobId: String(jobId),
+          workerId: String(workerId)
+        });
+
+        if (existingApp) {
+          return res.status(409).json({ 
+            error: 'Application already exists',
+            code: 'DUPLICATE_APPLICATION',
+            application: existingApp
+          });
+        }
+
+        // Worker details from aggregation (Task 5.1)
+        const workerName = workerFromLookup?.displayName ||
+                          [workerFromLookup?.firstName, workerFromLookup?.lastName].filter(Boolean).join(' ') ||
+                          workerFromLookup?.email ||
+                          'Worker';
+        
+        // Task 1.3: Enhanced proposal validation
+        const customProposal = req.body.proposal || null;
+        if (customProposal) {
+          const trimmed = customProposal.trim();
+          if (trimmed.length < 10) {
+            return res.status(400).json({ 
+              error: 'Proposal must be at least 10 characters long',
+              providedLength: trimmed.length,
+              requiredLength: 10
+            });
+          }
+          if (trimmed.length > 5000) {
+            return res.status(400).json({ 
+              error: 'Proposal must not exceed 5000 characters',
+              providedLength: trimmed.length,
+              maxLength: 5000
+            });
+          }
+        }
+        const proposalText = customProposal ? customProposal.trim() : `Accepted job offer: ${job.title}`;
+
+        // Proposed price (different budget) - optional; client can accept/counter
+        let proposedPrice = null;
+        if (req.body.proposedPrice != null) {
+          const p = parseFloat(req.body.proposedPrice);
+          if (isNaN(p) || p <= 0) {
+            return res.status(400).json({ error: 'Proposed price must be a positive number' });
+          }
+          proposedPrice = p;
+        }
+        const currency = (req.body.currency || job.currency || 'BDT').trim() || 'BDT';
+
+        // Task 1.2: Implement MongoDB Transactions for Atomic Operations
+        const session = client.startSession();
+        let application;
+        try {
+          await session.withTransaction(async () => {
+            // Task 4.1: Update job status and offerStatus when offer is accepted
+            await browseJobsCollection.updateOne(
+              { _id: new ObjectId(jobId) },
+              { 
+                $set: { 
+                  status: 'in-progress',
+                  offerStatus: 'accepted',
+                  offerAcceptedAt: new Date(),
+                  updatedAt: new Date() 
+                } 
+              },
+              { session }
+            );
+
+            // Create application with 'accepted' status; include proposalText (client UI) and proposedPrice if worker proposed different budget
+            const applicationDoc = {
+              jobId: String(jobId),
+              workerId: String(workerId),
+              clientId: String(job.clientId),
+              workerName: workerName,
+              clientEmail: job.postedByEmail || null,
+              status: 'accepted',
+              proposal: proposalText,
+              proposalText: proposalText,
+              createdAt: new Date(),
+              updatedAt: new Date()
+            };
+            if (proposedPrice != null) {
+              applicationDoc.proposedPrice = proposedPrice;
+              applicationDoc.currency = currency;
+            }
+
+            const result = await applicationsCollection.insertOne(applicationDoc, { session });
+            application = await applicationsCollection.findOne(
+              { _id: result.insertedId },
+              { session }
+            );
+
+            // Send system messages to chat to notify both parties of acceptance
+            if (job.conversationId) {
+              // Message to client - worker accepted the job offer
+              const clientProposalPart = customProposal ? `\n\n💬 Worker's Proposal:\n${customProposal}` : '\n\nThe worker is ready to start working on this job.';
+              const clientPricePart = proposedPrice != null ? `\n\n💰 Worker's proposed price: ${proposedPrice} ${currency}` : '';
+              const clientMessage = {
+                conversationId: String(job.conversationId),
+                senderId: String(workerId),
+                recipientId: String(job.clientId),
+                jobId: String(jobId),
+                message: `✅ ${workerName} has accepted your job offer!\n\n📋 Job: ${job.title}${job.budget ? `\n💰 Budget: ${job.budget} ${job.currency || 'BDT'}` : ''}${job.location ? `\n📍 Location: ${job.location}` : ''}${clientPricePart}${clientProposalPart}`,
+                senderName: 'System',
+                recipientName: '',
+                read: false,
+                createdAt: new Date(),
+                isSystemMessage: true
+              };
+
+              const workerPricePart = proposedPrice != null ? `\n\n💰 Your proposed price: ${proposedPrice} ${currency}` : '';
+              // Message to worker - confirmation of acceptance
+              const workerMessage = {
+                conversationId: String(job.conversationId),
+                senderId: String(job.clientId),
+                recipientId: String(workerId),
+                jobId: String(jobId),
+                message: `✅ You've accepted the job offer!\n\n📋 Job: ${job.title}${job.budget ? `\n💰 Budget: ${job.budget} ${job.currency || 'BDT'}` : ''}${job.location ? `\n📍 Location: ${job.location}` : ''}${workerPricePart}${customProposal ? `\n\n💬 Your Proposal:\n${customProposal}` : ''}\n\n🎉 You can now start working on this job. Contact the client to coordinate the details.`,
+                senderName: 'System',
+                recipientName: '',
+                read: false,
+                createdAt: new Date(),
+                isSystemMessage: true
+              };
+
+              await messagesCollection.insertMany([clientMessage, workerMessage], { session });
+            }
+            
+            // Task 4.2: Log acceptance to audit trail
+            await jobOfferHistoryCollection.insertOne({
+              jobId: String(jobId),
+              workerId: String(workerId),
+              action: 'accepted',
+              proposal: proposalText,
+              createdAt: new Date(),
+              metadata: {
+                workerName: workerName,
+                customProposal: !!customProposal
+              }
+            }, { session });
+            
+            return application;
+          });
+        } catch (transactionErr) {
+          // Transaction will auto-rollback
+          throw transactionErr;
+        } finally {
+          await session.endSession();
+        }
+
+        // Emit WebSocket events for real-time notification (outside transaction)
+        if (job.conversationId) {
+          try {
+            const wsClientProposalPart = customProposal ? `\n\n💬 Worker's Proposal:\n${customProposal}` : '\n\nThe worker is ready to start working on this job.';
+            const wsClientPricePart = proposedPrice != null ? `\n\n💰 Worker's proposed price: ${proposedPrice} ${currency}` : '';
+            const clientMessage = {
+              conversationId: String(job.conversationId),
+              senderId: String(workerId),
+              recipientId: String(job.clientId),
+              jobId: String(jobId),
+              message: `✅ ${workerName} has accepted your job offer!\n\n📋 Job: ${job.title}${job.budget ? `\n💰 Budget: ${job.budget} ${job.currency || 'BDT'}` : ''}${job.location ? `\n📍 Location: ${job.location}` : ''}${wsClientPricePart}${wsClientProposalPart}`,
+              senderName: 'System',
+              recipientName: '',
+              read: false,
+              createdAt: new Date(),
+              isSystemMessage: true
+            };
+
+            const wsWorkerPricePart = proposedPrice != null ? `\n\n💰 Your proposed price: ${proposedPrice} ${currency}` : '';
+            const workerMessage = {
+              conversationId: String(job.conversationId),
+              senderId: String(job.clientId),
+              recipientId: String(workerId),
+              jobId: String(jobId),
+              message: `✅ You've accepted the job offer!\n\n📋 Job: ${job.title}${job.budget ? `\n💰 Budget: ${job.budget} ${job.currency || 'BDT'}` : ''}${job.location ? `\n📍 Location: ${job.location}` : ''}${wsWorkerPricePart}${customProposal ? `\n\n💬 Your Proposal:\n${customProposal}` : ''}\n\n🎉 You can now start working on this job. Contact the client to coordinate the details.`,
+              senderName: 'System',
+              recipientName: '',
+              read: false,
+              createdAt: new Date(),
+              isSystemMessage: true
+            };
+
+            io.to(job.clientId).emit('new_message', clientMessage);
+            io.to(workerId).emit('new_message', workerMessage);
+            io.to(job.conversationId).emit('new_message', clientMessage);
+            io.to(job.conversationId).emit('new_message', workerMessage);
+            
+            // Task 3.1: Emit job offer status change event
+            io.to(job.conversationId).emit('job_offer:status_changed', {
+              jobId: String(jobId),
+              status: 'accepted',
+              application: application,
+              timestamp: new Date()
+            });
+          } catch (msgErr) {
+            console.error('Failed to emit WebSocket events:', msgErr);
+          }
+        }
+
+        // Send notification to client
+        try {
+          const client = await usersCollection.findOne({ uid: String(job.clientId) });
+          if (client?.email) {
+            sendApplicationReceivedEmail(
+              client.email,
+              client.displayName || 'Client',
+              job.title,
+              workerName
+            ).catch(err => console.error('Failed to send acceptance email:', err));
+          }
+        } catch (emailErr) {
+          console.error('Error sending acceptance email:', emailErr);
+        }
+
+        invalidateConversationJobsCache(job.conversationId);
+
+        // Task 1.1: Include expiration info in response
+        res.status(201).json({
+          success: true,
+          application: application,
+          expiration: {
+            expiresAt: job.expiresAt,
+            timeRemaining: timeRemaining,
+            hoursRemaining: hoursRemaining,
+            isExpiringSoon: isExpiringSoon
+          }
+        });
+      } catch (err) {
+        // Task 1.4: Improved Error Handling and Messages
+        console.error('POST /api/job-offers/:jobId/accept failed:', err);
+        
+        // Check for specific error types
+        if (err.code === 11000) {
+          return res.status(409).json({ 
+            error: 'Application already exists',
+            code: 'DUPLICATE_APPLICATION'
+          });
+        }
+        
+        if (err.name === 'MongoError' && err.code === 251) {
+          return res.status(503).json({ 
+            error: 'Database transaction failed. Please try again.',
+            code: 'TRANSACTION_FAILED',
+            retryable: true
+          });
+        }
+        
+        if (err.name === 'MongoServerError' && err.code === 251) {
+          return res.status(503).json({ 
+            error: 'Database transaction failed. Please try again.',
+            code: 'TRANSACTION_FAILED',
+            retryable: true
+          });
+        }
+        
+        res.status(500).json({ 
+          error: 'Failed to accept job offer',
+          code: 'INTERNAL_ERROR',
+          details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
+      }
+    });
+
+    // Reject a job offer
+    app.post('/api/job-offers/:jobId/reject', jobOfferLimiter, authenticateUser, authorizeWorker, async (req, res) => {
+      try {
+        const { jobId } = req.params;
+        const { workerId } = req.body;
+
+        if (!ObjectId.isValid(jobId)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        if (!workerId) {
+          return res.status(400).json({ error: 'workerId is required' });
+        }
+
+        // Task 5.1: Optimize with aggregation - job + targetWorker in one query
+        const jobWithWorkerReject = await browseJobsCollection.aggregate([
+          { $match: { _id: new ObjectId(jobId) } },
+          { $lookup: { from: 'users', localField: 'targetWorkerId', foreignField: 'uid', as: 'targetWorker' } },
+          { $addFields: { targetWorker: { $arrayElemAt: ['$targetWorker', 0] } } },
+          { $project: { _id: 1, title: 1, clientId: 1, targetWorkerId: 1, isPrivate: 1, status: 1, expiresAt: 1, conversationId: 1, offerStatus: 1, targetWorker: 1 } }
+        ]).toArray();
+        const rowReject = jobWithWorkerReject[0];
+        if (!rowReject) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+        const job = { _id: rowReject._id, title: rowReject.title, clientId: rowReject.clientId, targetWorkerId: rowReject.targetWorkerId, isPrivate: rowReject.isPrivate, status: rowReject.status, expiresAt: rowReject.expiresAt, conversationId: rowReject.conversationId, offerStatus: rowReject.offerStatus };
+
+        if (!job.isPrivate) {
+          return res.status(400).json({ error: 'This endpoint is only for private job offers' });
+        }
+
+        // Verify workerId matches targetWorkerId
+        if (job.targetWorkerId !== String(workerId)) {
+          return res.status(403).json({ error: 'You are not authorized to reject this job offer' });
+        }
+
+        // Get rejection reason if provided
+        const rejectionReason = req.body.reason || req.body.message || null;
+
+        // Create rejection record and send system message to notify the client
+        if (job.conversationId) {
+          try {
+            const workerFromLookupReject = rowReject.targetWorker;
+            const workerName = workerFromLookupReject?.displayName || workerFromLookupReject?.email || 'Worker';
+
+            const rejectionMessageText = rejectionReason 
+              ? `❌ Job offer rejected: ${job.title}\n\nReason: ${rejectionReason}`
+              : `❌ Job offer rejected: ${job.title}`;
+
+            const rejectionMessage = {
+              conversationId: String(job.conversationId),
+              senderId: String(workerId),
+              recipientId: String(job.clientId),
+              jobId: String(jobId),
+              message: rejectionMessageText,
+              senderName: 'System',
+              recipientName: '',
+              read: false,
+              createdAt: new Date(),
+              isSystemMessage: true
+            };
+
+            await messagesCollection.insertOne(rejectionMessage);
+
+            // Emit WebSocket event
+            io.to(job.clientId).emit('new_message', rejectionMessage);
+            io.to(job.conversationId).emit('new_message', rejectionMessage);
+            
+            // Task 3.1: Emit job offer status change event
+            io.to(job.conversationId).emit('job_offer:status_changed', {
+              jobId: String(jobId),
+              status: 'rejected',
+              reason: rejectionReason,
+              timestamp: new Date()
+            });
+            
+            // Task 4.2: Log rejection to audit trail
+            await jobOfferHistoryCollection.insertOne({
+              jobId: String(jobId),
+              workerId: String(workerId),
+              action: 'rejected',
+              reason: rejectionReason,
+              createdAt: new Date()
+            });
+          } catch (msgErr) {
+            console.error('Failed to create rejection message:', msgErr);
+          }
+        }
+
+        // Task 4.1: Update job to track rejection with offerStatus
+        await browseJobsCollection.updateOne(
+          { _id: new ObjectId(jobId) },
+          { 
+            $set: { 
+              offerStatus: 'rejected',
+              offerRejected: true, 
+              offerRejectedAt: new Date(), 
+              offerRejectedBy: String(workerId),
+              updatedAt: new Date() 
+            } 
+          }
+        );
+
+        invalidateConversationJobsCache(job.conversationId);
+
+        res.json({
+          success: true,
+          message: 'Job offer rejected'
+        });
+      } catch (err) {
+        console.error('POST /api/job-offers/:jobId/reject failed:', err);
+        res.status(500).json({ error: 'Failed to reject job offer' });
+      }
+    });
+
+    // Task 6.2: Withdraw job offer (client can withdraw)
+    app.post('/api/job-offers/:jobId/withdraw', jobOfferLimiter, async (req, res) => {
+      try {
+        const { jobId } = req.params;
+        const { clientId } = req.body;
+
+        if (!ObjectId.isValid(jobId)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        if (!clientId) {
+          return res.status(400).json({ error: 'clientId is required' });
+        }
+
+        const job = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+        if (!job) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        if (String(job.clientId) !== String(clientId)) {
+          return res.status(403).json({ error: 'You are not authorized to withdraw this job offer' });
+        }
+
+        if (!job.isPrivate) {
+          return res.status(400).json({ error: 'This endpoint is only for private job offers' });
+        }
+
+        // Check if already accepted
+        const existingApp = await applicationsCollection.findOne({
+          jobId: String(jobId),
+          workerId: String(job.targetWorkerId)
+        });
+
+        if (existingApp) {
+          return res.status(400).json({ error: 'Cannot withdraw: Job offer has already been accepted' });
+        }
+
+        // Update job status
+        await browseJobsCollection.updateOne(
+          { _id: new ObjectId(jobId) },
+          { 
+            $set: { 
+              offerStatus: 'withdrawn',
+              offerWithdrawnAt: new Date(),
+              status: 'cancelled',
+              updatedAt: new Date() 
+            } 
+          }
+        );
+
+        // Send notification message
+        if (job.conversationId && job.targetWorkerId) {
+          try {
+            const client = await usersCollection.findOne({ uid: String(clientId) });
+            const clientName = client?.displayName || client?.email || 'Client';
+
+            const withdrawalMessage = {
+              conversationId: String(job.conversationId),
+              senderId: String(clientId),
+              recipientId: String(job.targetWorkerId),
+              jobId: String(jobId),
+              message: `⚠️ Job offer withdrawn: ${job.title}\n\nThe client has withdrawn this job offer.`,
+              senderName: 'System',
+              recipientName: '',
+              read: false,
+              createdAt: new Date(),
+              isSystemMessage: true
+            };
+
+            await messagesCollection.insertOne(withdrawalMessage);
+            io.to(job.targetWorkerId).emit('new_message', withdrawalMessage);
+            io.to(job.conversationId).emit('new_message', withdrawalMessage);
+            io.to(job.conversationId).emit('job_offer:status_changed', {
+              jobId: String(jobId),
+              status: 'withdrawn',
+              timestamp: new Date()
+            });
+          } catch (msgErr) {
+            console.error('Failed to create withdrawal message:', msgErr);
+          }
+        }
+
+        invalidateConversationJobsCache(job.conversationId);
+
+        res.json({
+          success: true,
+          message: 'Job offer withdrawn successfully'
+        });
+      } catch (err) {
+        console.error('POST /api/job-offers/:jobId/withdraw failed:', err);
+        res.status(500).json({ error: 'Failed to withdraw job offer' });
+      }
+    });
+
+    // Task 6.3: Analytics endpoints for job offers
+    app.get('/api/job-offers/analytics/:jobId', async (req, res) => {
+      try {
+        const { jobId } = req.params;
+
+        if (!ObjectId.isValid(jobId)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        const job = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+        if (!job) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        // Get history
+        const history = await jobOfferHistoryCollection.find({ jobId: String(jobId) })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        // Calculate metrics
+        const accepted = history.filter(h => h.action === 'accepted').length;
+        const rejected = history.filter(h => h.action === 'rejected').length;
+        const totalActions = history.length;
+
+        // Calculate time to accept (if accepted)
+        let timeToAccept = null;
+        const acceptanceRecord = history.find(h => h.action === 'accepted');
+        if (acceptanceRecord && job.createdAt) {
+          timeToAccept = new Date(acceptanceRecord.createdAt) - new Date(job.createdAt);
+        }
+
+        res.json({
+          jobId: String(jobId),
+          metrics: {
+            totalActions,
+            accepted,
+            rejected,
+            acceptanceRate: totalActions > 0 ? (accepted / totalActions) * 100 : 0,
+            timeToAccept: timeToAccept ? Math.floor(timeToAccept / (1000 * 60 * 60)) : null // in hours
+          },
+          history: history.map(h => ({
+            action: h.action,
+            workerId: h.workerId,
+            createdAt: h.createdAt,
+            reason: h.reason,
+            proposal: h.proposal
+          }))
+        });
+      } catch (err) {
+        console.error('GET /api/job-offers/analytics/:jobId failed:', err);
+        res.status(500).json({ error: 'Failed to fetch analytics' });
+      }
+    });
+
+    // Task 6.1: Set reminder for "Accept Later"
+    app.post('/api/job-offers/:jobId/remind-later', jobOfferLimiter, async (req, res) => {
+      try {
+        const { jobId } = req.params;
+        const { workerId, reminderAt } = req.body;
+
+        if (!ObjectId.isValid(jobId)) {
+          return res.status(400).json({ error: 'Invalid job ID' });
+        }
+
+        if (!workerId) {
+          return res.status(400).json({ error: 'workerId is required' });
+        }
+
+        if (!reminderAt) {
+          return res.status(400).json({ error: 'reminderAt is required' });
+        }
+
+        const reminderDate = new Date(reminderAt);
+        if (isNaN(reminderDate.getTime()) || reminderDate <= new Date()) {
+          return res.status(400).json({ error: 'Reminder date must be in the future' });
+        }
+
+        const job = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
+        if (!job) {
+          return res.status(404).json({ error: 'Job not found' });
+        }
+
+        if (String(job.targetWorkerId) !== String(workerId)) {
+          return res.status(403).json({ error: 'You are not authorized to set reminder for this job offer' });
+        }
+
+        // Check if reminder already exists
+        const existingReminder = await jobOfferRemindersCollection.findOne({
+          jobId: String(jobId),
+          workerId: String(workerId)
+        });
+
+        if (existingReminder) {
+          // Update existing reminder
+          await jobOfferRemindersCollection.updateOne(
+            { _id: existingReminder._id },
+            { $set: { reminderAt: reminderDate, updatedAt: new Date() } }
+          );
+        } else {
+          // Create new reminder
+          await jobOfferRemindersCollection.insertOne({
+            jobId: String(jobId),
+            workerId: String(workerId),
+            reminderAt: reminderDate,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+        }
+
+        res.json({
+          success: true,
+          message: 'Reminder set successfully',
+          reminderAt: reminderDate
+        });
+      } catch (err) {
+        console.error('POST /api/job-offers/:jobId/remind-later failed:', err);
+        res.status(500).json({ error: 'Failed to set reminder' });
       }
     });
 
@@ -1779,6 +3546,45 @@ async function startServer() {
           }
         }
 
+        // Validate private job fields
+        const isPrivate = jobData.isPrivate || false;
+        if (isPrivate) {
+          if (!jobData.conversationId) {
+            return res.status(400).json({ error: 'conversationId is required for private jobs' });
+          }
+          if (!jobData.targetWorkerId) {
+            return res.status(400).json({ error: 'targetWorkerId is required for private jobs' });
+          }
+          if (!jobData.clientId) {
+            return res.status(400).json({ error: 'clientId is required for private jobs' });
+          }
+          
+          // Validate that targetWorkerId exists and is a worker
+          const targetWorker = await usersCollection.findOne({ uid: String(jobData.targetWorkerId) });
+          if (!targetWorker) {
+            return res.status(404).json({ error: 'Target worker not found' });
+          }
+          if (targetWorker.role !== 'worker') {
+            return res.status(400).json({ error: 'Target user is not a worker' });
+          }
+          
+          // Check for duplicate jobs in the same conversation (within last 24 hours)
+          const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+          const duplicateJob = await browseJobsCollection.findOne({
+            conversationId: String(jobData.conversationId),
+            clientId: String(jobData.clientId),
+            title: String(jobData.title).trim(),
+            createdAt: { $gte: oneDayAgo },
+            status: { $ne: 'completed' }
+          });
+          if (duplicateJob) {
+            return res.status(409).json({ 
+              error: 'A similar job was already posted in this conversation recently. Please wait before posting again.', 
+              duplicateJobId: duplicateJob._id 
+            });
+          }
+        }
+
         const jobDoc = {
           ...jobData,
           status: 'active',
@@ -1786,10 +3592,80 @@ async function startServer() {
           createdAt: new Date(),
           expiresAt: expiresAt ? new Date(expiresAt) : null,
           autoCloseEnabled: !!expiresAt,
+          // New fields for private jobs - conversationId set after insert (canonical = jobId_clientId_workerId)
+          isPrivate: isPrivate,
+          conversationId: !isPrivate ? (jobData.conversationId || null) : null,
+          targetWorkerId: jobData.targetWorkerId || null,
+          createdFromChat: !!isPrivate,
+          // Task 4.1: Add offerStatus field for private jobs
+          offerStatus: isPrivate ? 'pending' : null,
         };
 
         const result = await browseJobsCollection.insertOne(jobDoc);
-        res.status(201).json({ message: '✅ Job posted successfully', jobId: result.insertedId });
+        const jobId = result.insertedId.toString();
+
+        // Single inbox: for private jobs use canonical conversationId (jobId_clientId_workerId) so all messages stay in one thread
+        let canonicalConversationId = null;
+        if (isPrivate && jobData.clientId && jobData.targetWorkerId) {
+          const sortedIds = [String(jobData.clientId), String(jobData.targetWorkerId)].sort();
+          canonicalConversationId = `${jobId}_${sortedIds.join('_')}`;
+          await browseJobsCollection.updateOne(
+            { _id: result.insertedId },
+            { $set: { conversationId: canonicalConversationId } }
+          );
+        }
+
+        // If private job, send system message to notify worker (use canonical conversationId)
+        if (isPrivate && (canonicalConversationId || jobData.conversationId) && jobData.targetWorkerId) {
+          const conversationIdForMessage = canonicalConversationId || String(jobData.conversationId);
+          try {
+            // Get client name for the message
+            const client = await usersCollection.findOne({ uid: String(jobData.clientId) });
+            const clientName = client?.displayName || client?.email || 'Client';
+
+            const systemMessage = {
+              conversationId: conversationIdForMessage,
+              senderId: String(jobData.clientId),
+              recipientId: String(jobData.targetWorkerId),
+              jobId: jobId,
+              message: `📋 New job posted: ${jobData.title}${jobData.budget ? `\n💰 Budget: ${jobData.budget} ${jobData.currency || 'BDT'}` : ''}${jobData.location ? `\n📍 Location: ${jobData.location}` : ''}`,
+              senderName: 'System',
+              recipientName: '',
+              read: false,
+              createdAt: new Date(),
+              isSystemMessage: true
+            };
+
+            await messagesCollection.insertOne(systemMessage);
+
+            // Emit WebSocket event for real-time notification (worker and conversation room for client)
+            io.to(jobData.targetWorkerId).emit('new_message', systemMessage);
+            io.to(conversationIdForMessage).emit('new_message', systemMessage);
+            
+            // Task 6.4: Send email notification to worker
+            try {
+              const targetWorker = await usersCollection.findOne({ uid: String(jobData.targetWorkerId) });
+              if (targetWorker?.email) {
+                sendJobOfferEmail(
+                  targetWorker.email,
+                  targetWorker.displayName || targetWorker.email || 'Worker',
+                  jobData.title,
+                  clientName,
+                  jobData.budget,
+                  jobData.currency,
+                  expiresAt
+                ).catch(err => console.error('Failed to send job offer email:', err));
+              }
+            } catch (emailErr) {
+              console.error('Error sending job offer email:', emailErr);
+            }
+          } catch (msgErr) {
+            // Log error but don't fail the job creation
+            console.error('Failed to create system message for private job:', msgErr);
+          }
+        }
+
+        res.status(201).json({ message: '✅ Job posted successfully', jobId: jobId });
       } catch (err) {
         console.error('❌ Failed to post job:', err);
         res.status(500).json({ error: 'Failed to post job' });
@@ -1931,6 +3807,40 @@ async function startServer() {
               // Send email asynchronously (don't block response)
               sendJobStatusEmail(clientEmail, clientName, jobTitle, newStatus)
                 .catch(err => console.error('Failed to send job status email:', err));
+            }
+
+            // Send system messages to all workers with active applications for this job
+            try {
+              const applications = await applicationsCollection.find({
+                jobId: String(id),
+                status: { $in: ['pending', 'accepted'] }
+              }).toArray();
+
+              for (const app of applications) {
+                if (app.workerId && updatedJob.clientId) {
+                  const conversationId = await findOrCreateConversationId(
+                    id,
+                    updatedJob.clientId,
+                    app.workerId
+                  );
+                  
+                  if (conversationId) {
+                    const statusEmoji = getStatusEmoji(newStatus);
+                    const messageText = `📊 Job status updated: ${jobTitle}\n🔄 New status: ${statusEmoji} ${newStatus}`;
+                    
+                    await sendSystemMessage(
+                      conversationId,
+                      updatedJob.clientId,
+                      app.workerId,
+                      id,
+                      messageText
+                    );
+                  }
+                }
+              }
+            } catch (msgErr) {
+              console.error('Error sending system messages for job status change:', msgErr);
+              // Don't fail the request if messages fail
             }
           } catch (emailErr) {
             console.error('Error sending job status email:', emailErr);
@@ -2655,6 +4565,37 @@ async function startServer() {
               } catch (emailErr) {
                 console.error('Failed to send expiration email:', emailErr);
               }
+            }
+
+            // Send system messages to all workers with active applications for this job
+            try {
+              const applications = await applicationsCollection.find({
+                jobId: String(job._id),
+                status: { $in: ['pending', 'accepted'] }
+              }).toArray();
+
+              for (const app of applications) {
+                if (app.workerId && job.clientId) {
+                  const conversationId = await findOrCreateConversationId(
+                    String(job._id),
+                    String(job.clientId),
+                    app.workerId
+                  );
+                  
+                  if (conversationId) {
+                    await sendSystemMessage(
+                      conversationId,
+                      String(job.clientId),
+                      app.workerId,
+                      String(job._id),
+                      `⏰ Job expired: ${job.title || 'Untitled Job'}\n\nThe job has expired and been automatically closed.`
+                    );
+                  }
+                }
+              }
+            } catch (msgErr) {
+              console.error('Error sending system messages for expired job:', msgErr);
+              // Don't fail the expiration process if messages fail
             }
 
             console.log(`✅ Expired job "${job.title || job._id}" has been closed`);

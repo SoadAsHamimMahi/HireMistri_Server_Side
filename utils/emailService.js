@@ -119,11 +119,73 @@ async function sendNewMessageEmail(recipientEmail, recipientName, senderName, jo
   return await sendEmail(recipientEmail, subject, html);
 }
 
+/**
+ * Task 6.4: Send job offer notification email to worker
+ */
+async function sendJobOfferEmail(workerEmail, workerName, jobTitle, clientName, budget, currency, expiresAt) {
+  const subject = `New Job Offer: "${jobTitle}"`;
+  const expirationText = expiresAt 
+    ? `<p><strong>Expires:</strong> ${new Date(expiresAt).toLocaleDateString()}</p>`
+    : '';
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <h2 style="color: #333;">New Job Offer Received</h2>
+      <p>Hello ${workerName},</p>
+      <p>You have received a new job offer from <strong>${clientName}</strong>!</p>
+      <p><strong>Job Title:</strong> ${jobTitle}</p>
+      ${budget ? `<p><strong>Budget:</strong> ${budget} ${currency || 'BDT'}</p>` : ''}
+      ${expirationText}
+      <p>Please log in to your dashboard to view the full details and respond to this offer.</p>
+      <p style="margin-top: 30px; color: #666; font-size: 12px;">This is an automated notification from Hire Mistri.</p>
+    </div>
+  `;
+  return await sendEmail(workerEmail, subject, html);
+}
+
+/**
+ * Task 6.4: Send job offer reminder email to worker
+ */
+async function sendJobOfferReminderEmail(workerEmail, workerName, jobTitle, hoursRemaining) {
+  const subject = `Reminder: Job Offer Expiring Soon - "${jobTitle}"`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <h2 style="color: #333;">Job Offer Expiring Soon</h2>
+      <p>Hello ${workerName},</p>
+      <p>This is a reminder that you have a pending job offer that will expire soon.</p>
+      <p><strong>Job Title:</strong> ${jobTitle}</p>
+      <p><strong>Time Remaining:</strong> ${hoursRemaining} hours</p>
+      <p>Please log in to your dashboard to review and respond to this offer before it expires.</p>
+      <p style="margin-top: 30px; color: #666; font-size: 12px;">This is an automated notification from Hire Mistri.</p>
+    </div>
+  `;
+  return await sendEmail(workerEmail, subject, html);
+}
+
+/**
+ * Task 6.4: Send job offer expiration notification email to worker
+ */
+async function sendJobOfferExpiredEmail(workerEmail, workerName, jobTitle) {
+  const subject = `Job Offer Expired - "${jobTitle}"`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <h2 style="color: #333;">Job Offer Expired</h2>
+      <p>Hello ${workerName},</p>
+      <p>Unfortunately, the job offer for <strong>${jobTitle}</strong> has expired.</p>
+      <p>You can still browse other available jobs on the platform.</p>
+      <p style="margin-top: 30px; color: #666; font-size: 12px;">This is an automated notification from Hire Mistri.</p>
+    </div>
+  `;
+  return await sendEmail(workerEmail, subject, html);
+}
+
 module.exports = {
   sendEmail,
   sendApplicationReceivedEmail,
   sendApplicationStatusEmail,
   sendJobStatusEmail,
   sendNewMessageEmail,
+  sendJobOfferEmail,
+  sendJobOfferReminderEmail,
+  sendJobOfferExpiredEmail,
 };
 
