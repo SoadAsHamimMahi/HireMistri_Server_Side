@@ -135,7 +135,9 @@ const upload = multer({ storage });
 app.use('/uploads', express.static(uploadsDir));
 
 // -------- Mongo client ------------
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.3zws6aa.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+const uri =
+  process.env.MONGODB_URI?.trim() ||
+  `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.3zws6aa.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
@@ -143,7 +145,20 @@ const client = new MongoClient(uri, {
 
 // Optional Firebase Admin (for identity backfill)
 let admin = null;
-if (process.env.FIREBASE_CONFIG) {
+const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+if (serviceAccountPath && fs.existsSync(serviceAccountPath)) {
+  try {
+    admin = require('firebase-admin');
+    if (admin.apps.length === 0) {
+      const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    }
+    console.log('🔥 Firebase Admin initialized');
+  } catch (e) {
+    console.error('Firebase init failed:', e);
+    admin = null;
+  }
+} else if (process.env.FIREBASE_CONFIG) {
   try {
     admin = require('firebase-admin');
     if (admin.apps.length === 0) {
@@ -173,6 +188,24 @@ const authenticateUser = async (req, res, next) => {
     // Verify Firebase token
     const decodedToken = await admin.auth().verifyIdToken(token);
     req.user = decodedToken;
+
+    // Enforce account suspension (set by admin panel)
+    // Only applies when usersCollection is ready.
+    if (usersCollection) {
+      try {
+        const uid = String(decodedToken.uid || '').trim();
+        if (uid) {
+          const userDoc = await usersCollection.findOne({ uid });
+          if (userDoc?.isSuspended) {
+            return res.status(403).json({ error: 'Account suspended' });
+          }
+        }
+      } catch (e) {
+        // If user lookup fails, don't block authentication entirely
+        console.warn('Suspension check failed:', e.message);
+      }
+    }
+
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired token' });
@@ -214,6 +247,101 @@ let savedJobsCollection;
 let workerJobRequestsCollection;
 let jobOfferHistoryCollection; // Task 4.2: Audit trail collection
 let jobOfferRemindersCollection; // Task 6.1: Accept Later reminders
+let adminUsersCollection;
+let paymentRequestsCollection;
+let settlementsCollection;
+let cashCollectionsCollection;
+let servicesCollection;
+let categoriesCollection;
+let transactionsCollection;
+let userQueriesCollection;
+let reportingReasonsCollection;
+let blockedUsersCollection;
+let promoCodesCollection;
+let slidersCollection;
+let featuredSectionCollection;
+let subscriptionPlansCollection;
+let userSubscriptionsCollection;
+let galleryCollection;
+let faqsCollection;
+let adminAuditLogCollection;
+let supportTicketsCollection;
+let supportMessagesCollection;
+
+// In-memory rate limit for admin sensitive operations
+const adminRateLimitStore = new Map();
+const ADMIN_RATE_WINDOW_MS = 60 * 1000; // 1 minute
+const ADMIN_BULK_MAX = 10;
+const ADMIN_BACKUP_MAX = 2;
+
+function adminRateLimiter(keyPrefix, maxPerWindow) {
+  return (req, res, next) => {
+    const uid = req.user?.uid || req.ip || 'unknown';
+    const key = `${keyPrefix}:${uid}`;
+    const now = Date.now();
+    let entry = adminRateLimitStore.get(key);
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + ADMIN_RATE_WINDOW_MS };
+      adminRateLimitStore.set(key, entry);
+    }
+    entry.count++;
+    if (entry.count > maxPerWindow) {
+      return res.status(429).json({
+        error: 'Too many requests. Please try again later.',
+        retryAfter: Math.ceil((entry.resetAt - now) / 1000),
+      });
+    }
+    next();
+  };
+}
+
+// Admin auth: verify Firebase ID token and ensure user is in adminUsers collection
+const authenticateAdmin = async (req, res, next) => {
+  try {
+    if (!admin) {
+      return res.status(503).json({ error: 'Admin auth not configured' });
+    }
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = decodedToken;
+    if (!adminUsersCollection) {
+      return res.status(503).json({ error: 'Admin users collection not ready' });
+    }
+    const adminDoc = await adminUsersCollection.findOne({ uid: decodedToken.uid });
+    if (!adminDoc) {
+      return res.status(403).json({ error: 'Not an admin user' });
+    }
+    req.adminUser = adminDoc;
+    next();
+  } catch (err) {
+    // Firebase auth errors (invalid/expired token)
+    if (err.code && String(err.code).startsWith('auth/')) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    // Unexpected errors (e.g. MongoDB) - log and return 500
+    console.error('authenticateAdmin failed:', err);
+    return res.status(500).json({ error: 'Auth check failed', message: err.message });
+  }
+};
+
+// Append-only admin action log (call after successful admin mutations)
+async function logAdminAction(req, action, resource, details = {}) {
+  if (!adminAuditLogCollection || !req.user?.uid) return;
+  try {
+    await adminAuditLogCollection.insertOne({
+      adminUid: req.user.uid,
+      action,
+      resource,
+      details,
+      createdAt: new Date(),
+    });
+  } catch (e) {
+    console.warn('Admin audit log write failed:', e.message);
+  }
+}
 
 async function startServer() {
   try {
@@ -232,10 +360,33 @@ async function startServer() {
     workerJobRequestsCollection = db.collection('workerJobRequests');
     jobOfferHistoryCollection = db.collection('jobOfferHistory'); // Task 4.2: Audit trail
     jobOfferRemindersCollection = db.collection('jobOfferReminders'); // Task 6.1: Accept Later reminders
+    adminUsersCollection = db.collection('adminUsers');
+    paymentRequestsCollection = db.collection('paymentRequests');
+    settlementsCollection = db.collection('settlements');
+    cashCollectionsCollection = db.collection('cashCollections');
+    servicesCollection = db.collection('services');
+    categoriesCollection = db.collection('categories');
+    transactionsCollection = db.collection('transactions');
+    userQueriesCollection = db.collection('userQueries');
+    reportingReasonsCollection = db.collection('reportingReasons');
+    blockedUsersCollection = db.collection('blockedUsers');
+    promoCodesCollection = db.collection('promoCodes');
+    slidersCollection = db.collection('sliders');
+    featuredSectionCollection = db.collection('featuredSection');
+    subscriptionPlansCollection = db.collection('subscriptionPlans');
+    userSubscriptionsCollection = db.collection('userSubscriptions');
+    galleryCollection = db.collection('gallery');
+    faqsCollection = db.collection('faqs');
+    adminAuditLogCollection = db.collection('adminAuditLog');
+    supportTicketsCollection = db.collection('supportTickets');
+    supportMessagesCollection = db.collection('supportMessages');
 
     // ---------- indexes ----------
     await usersCollection.createIndex({ uid: 1 }, { unique: true, sparse: true });
     await usersCollection.createIndex({ email: 1 }, { unique: true, sparse: true });
+    await adminUsersCollection.createIndex({ uid: 1 }, { unique: true });
+    await adminAuditLogCollection.createIndex({ createdAt: -1 });
+    await adminAuditLogCollection.createIndex({ adminUid: 1, createdAt: -1 });
 
     await applicationsCollection.createIndex({ jobId: 1 });
     await applicationsCollection.createIndex({ workerId: 1 });
@@ -260,6 +411,11 @@ async function startServer() {
     await messagesCollection.createIndex({ senderId: 1 });
     await messagesCollection.createIndex({ recipientId: 1 });
     await messagesCollection.createIndex({ jobId: 1 });
+
+    // Support tickets/messages indexes
+    await supportTicketsCollection.createIndex({ userId: 1, updatedAt: -1 });
+    await supportTicketsCollection.createIndex({ userRole: 1, status: 1, updatedAt: -1 });
+    await supportMessagesCollection.createIndex({ ticketId: 1, createdAt: 1 });
 
     // Notifications indexes
     await notificationsCollection.createIndex({ userId: 1, read: 1, createdAt: -1 });
@@ -705,6 +861,1312 @@ async function startServer() {
 
     // ---------- Routes start ----------
 
+    // ===== ADMIN (must be authenticated admin) =====
+    app.get('/api/admin/me', authenticateAdmin, (req, res) => {
+      try {
+        if (!req.user || !req.adminUser) {
+          console.error('GET /api/admin/me: req.user or req.adminUser missing');
+          return res.status(500).json({ error: 'Admin auth state missing' });
+        }
+        res.json({
+          ok: true,
+          user: { uid: req.user.uid, email: req.user.email || '' },
+          permissions: req.adminUser.permissions || ['*'],
+        });
+      } catch (err) {
+        console.error('GET /api/admin/me failed:', err);
+        res.status(500).json({ error: 'Server error', message: err.message });
+      }
+    });
+
+    // -------- Admin: Providers (workers) --------
+    app.get('/api/admin/providers', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const status = req.query.status; // active | suspended | all
+        const q = { role: 'worker' };
+        if (status === 'active') q.isSuspended = { $ne: true };
+        if (status === 'suspended') q.isSuspended = true;
+        const [list, total] = await Promise.all([
+          usersCollection.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          usersCollection.countDocuments(q),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/providers failed:', err);
+        res.status(500).json({ error: 'Failed to fetch providers' });
+      }
+    });
+
+    app.get('/api/admin/providers/:uid', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const doc = await usersCollection.findOne({ uid, role: 'worker' });
+        if (!doc) return res.status(404).json({ error: 'Provider not found' });
+        const stats = await computeUserStats(uid);
+        res.json({ ...doc, stats: stats || {} });
+      } catch (err) {
+        console.error('GET /api/admin/providers/:uid failed:', err);
+        res.status(500).json({ error: 'Failed to fetch provider' });
+      }
+    });
+
+    app.patch('/api/admin/providers/:uid/status', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const { status } = req.body || {};
+        const s = String(status || '').toLowerCase();
+        if (!['active', 'suspended'].includes(s)) return res.status(400).json({ error: 'Invalid status' });
+        const result = await usersCollection.updateOne(
+          { uid, role: 'worker' },
+          { $set: { isSuspended: s === 'suspended', updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Provider not found' });
+        await logAdminAction(req, 'provider_status', 'providers', { providerUid: uid, status: s });
+        res.json({ ok: true, status: s });
+      } catch (err) {
+        console.error('PATCH /api/admin/providers/:uid/status failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: Bookings (applications + browseJobs) --------
+    app.get('/api/admin/bookings', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const status = req.query.status;
+        const q = {};
+        if (status) q.status = String(status).toLowerCase();
+        const [list, total] = await Promise.all([
+          applicationsCollection.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          applicationsCollection.countDocuments(q),
+        ]);
+        
+        // Enrich bookings with jobTitle + workerName + clientName for admin UI
+        const workerIds = Array.from(new Set(list.map((x) => String(x.workerId || '')).filter(Boolean)));
+        const clientIds = Array.from(new Set(list.map((x) => String(x.clientId || '')).filter(Boolean)));
+        const jobIdStrings = Array.from(new Set(list.map((x) => String(x.jobId || '')).filter(Boolean)));
+        const jobObjectIds = jobIdStrings.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id));
+
+        const [workers, clients, browseJobs, jobs] = await Promise.all([
+          workerIds.length
+            ? usersCollection
+                .find({ uid: { $in: workerIds } })
+                .project({ uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1 })
+                .toArray()
+            : [],
+          clientIds.length
+            ? usersCollection
+                .find({ uid: { $in: clientIds } })
+                .project({ uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1 })
+                .toArray()
+            : [],
+          jobObjectIds.length
+            ? browseJobsCollection.find({ _id: { $in: jobObjectIds } }).project({ title: 1 }).toArray()
+            : [],
+          jobObjectIds.length
+            ? jobsCollection.find({ _id: { $in: jobObjectIds } }).project({ title: 1 }).toArray()
+            : [],
+        ]);
+
+        const toName = (u) => {
+          if (!u) return null;
+          const full = [u.firstName, u.lastName].filter(Boolean).join(' ').trim();
+          return (u.displayName || full || u.email || u.uid || '').trim();
+        };
+
+        const workerNameByUid = new Map(workers.map((u) => [String(u.uid), toName(u)]));
+        const clientNameByUid = new Map(clients.map((u) => [String(u.uid), toName(u)]));
+        const jobTitleById = new Map();
+        browseJobs.forEach((j) => jobTitleById.set(String(j._id), String(j.title || '').trim()));
+        jobs.forEach((j) => jobTitleById.set(String(j._id), String(j.title || '').trim()));
+
+        const enriched = list.map((app) => {
+          const workerId = String(app.workerId || '');
+          const clientId = String(app.clientId || '');
+          const jobId = String(app.jobId || '');
+          return {
+            ...app,
+            workerName: workerNameByUid.get(workerId) || app.workerName || workerId || '',
+            clientName: clientNameByUid.get(clientId) || app.clientName || clientId || '',
+            jobTitle: jobTitleById.get(jobId) || app.jobTitle || app.jobName || '',
+          };
+        });
+
+        res.json({ list: enriched, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/bookings failed:', err);
+        res.status(500).json({ error: 'Failed to fetch bookings' });
+      }
+    });
+
+    app.patch('/api/admin/bookings/:id/status', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { status } = req.body || {};
+        const statusIn = String(status || '').toLowerCase().trim();
+        const allowed = new Set(['pending', 'accepted', 'rejected', 'completed']);
+        if (!ObjectId.isValid(id) || !allowed.has(statusIn)) {
+          return res.status(400).json({ error: 'Invalid id or status' });
+        }
+        const result = await applicationsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: statusIn, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Booking not found' });
+        await logAdminAction(req, 'booking_status', 'bookings', { applicationId: id, status: statusIn });
+        res.json({ ok: true, status: statusIn });
+      } catch (err) {
+        console.error('PATCH /api/admin/bookings/:id/status failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: Payment requests (providers) --------
+    app.get('/api/admin/payment-requests', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          paymentRequestsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          paymentRequestsCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/payment-requests failed:', err);
+        res.status(500).json({ error: 'Failed to fetch payment requests' });
+      }
+    });
+
+    app.post('/api/admin/payment-requests', authenticateAdmin, async (req, res) => {
+      try {
+        const { providerId, amount, reason } = req.body || {};
+        const doc = {
+          providerId: String(providerId || ''),
+          amount: Number(amount) || 0,
+          reason: String(reason || '').trim(),
+          status: 'pending',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await paymentRequestsCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/payment-requests failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/payment-requests/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { status } = req.body || {};
+        const statusIn = String(status || '').toLowerCase();
+        if (!['pending', 'approved', 'rejected'].includes(statusIn)) return res.status(400).json({ error: 'Invalid status' });
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await paymentRequestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: statusIn, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        await logAdminAction(req, 'payment_request_status', 'paymentRequests', { requestId: id, status: statusIn });
+        res.json({ ok: true, status: statusIn });
+      } catch (err) {
+        console.error('PATCH /api/admin/payment-requests/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: Settlements --------
+    app.get('/api/admin/settlements', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          settlementsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          settlementsCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/settlements failed:', err);
+        res.status(500).json({ error: 'Failed to fetch settlements' });
+      }
+    });
+
+    app.post('/api/admin/settlements', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          providerId: String(body.providerId || ''),
+          amount: Number(body.amount) || 0,
+          status: 'pending',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await settlementsCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/settlements failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    // -------- Admin: Cash collection --------
+    app.get('/api/admin/cash-collections', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          cashCollectionsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          cashCollectionsCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/cash-collections failed:', err);
+        res.status(500).json({ error: 'Failed to fetch cash collections' });
+      }
+    });
+
+    app.post('/api/admin/cash-collections', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          amount: Number(body.amount) || 0,
+          collectedBy: String(body.collectedBy || '').trim(),
+          status: 'recorded',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await cashCollectionsCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/cash-collections failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    // -------- Admin: Services --------
+    app.get('/api/admin/services', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const categoryId = req.query.categoryId;
+        const q = categoryId ? { categoryId: String(categoryId) } : {};
+        const [list, total] = await Promise.all([
+          servicesCollection.find(q).sort({ name: 1 }).skip(skip).limit(limit).toArray(),
+          servicesCollection.countDocuments(q),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/services failed:', err);
+        res.status(500).json({ error: 'Failed to fetch services' });
+      }
+    });
+
+    app.get('/api/admin/services/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const doc = await servicesCollection.findOne({ _id: new ObjectId(id) });
+        if (!doc) return res.status(404).json({ error: 'Service not found' });
+        res.json(doc);
+      } catch (err) {
+        console.error('GET /api/admin/services/:id failed:', err);
+        res.status(500).json({ error: 'Failed to fetch service' });
+      }
+    });
+
+    app.post('/api/admin/services', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          name: String(body.name || '').trim(),
+          slug: String((body.slug || body.name || '').toLowerCase().replace(/\s+/g, '-')).trim() || null,
+          categoryId: body.categoryId ? String(body.categoryId) : null,
+          description: String(body.description || '').trim(),
+          isActive: body.isActive !== false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await servicesCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/services failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/services/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.name !== undefined) $set.name = String(body.name).trim();
+        if (body.slug !== undefined) $set.slug = String(body.slug).trim();
+        if (body.categoryId !== undefined) $set.categoryId = body.categoryId ? String(body.categoryId) : null;
+        if (body.description !== undefined) $set.description = String(body.description).trim();
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        const result = await servicesCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Service not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/services/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.post('/api/admin/services/bulk', authenticateAdmin, adminRateLimiter('admin_bulk', ADMIN_BULK_MAX), async (req, res) => {
+      try {
+        const { ids, update } = req.body || {};
+        if (!Array.isArray(ids) || !update || typeof update !== 'object') {
+          return res.status(400).json({ error: 'ids array and update object required' });
+        }
+        const objectIds = ids.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id));
+        const $set = { updatedAt: new Date() };
+        if (typeof update.isActive === 'boolean') $set.isActive = update.isActive;
+        if (update.categoryId !== undefined) $set.categoryId = update.categoryId ? String(update.categoryId) : null;
+        const result = await servicesCollection.updateMany({ _id: { $in: objectIds } }, { $set });
+        await logAdminAction(req, 'services_bulk', 'services', { count: ids.length, modified: result.modifiedCount });
+        res.json({ ok: true, matched: result.matchedCount, modified: result.modifiedCount });
+      } catch (err) {
+        console.error('POST /api/admin/services/bulk failed:', err);
+        res.status(500).json({ error: 'Bulk update failed' });
+      }
+    });
+
+    // -------- Admin: Categories --------
+    app.get('/api/admin/categories', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await categoriesCollection.find({}).sort({ name: 1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/categories failed:', err);
+        res.status(500).json({ error: 'Failed to fetch categories' });
+      }
+    });
+
+    app.post('/api/admin/categories', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          name: String(body.name || '').trim(),
+          slug: String((body.slug || body.name || '').toLowerCase().replace(/\s+/g, '-')).trim() || null,
+          isActive: body.isActive !== false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await categoriesCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/categories failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/categories/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.name !== undefined) $set.name = String(body.name).trim();
+        if (body.slug !== undefined) $set.slug = String(body.slug).trim();
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        const result = await categoriesCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Category not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/categories/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: Customers (clients) --------
+    app.get('/api/admin/customers', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+
+        // Customers are not always stored with role='client' (e.g. /api/auth/sync defaults role to 'worker').
+        // For admin, treat "customers" as any uid that appears as a clientId/poster in jobs/browseJobs,
+        // plus any user explicitly marked role='client'.
+        // NOTE: MongoDB Stable API strict mode can reject `distinct` (APIStrictError).
+        // Use aggregation-based distinct to stay compatible with serverApi { strict: true }.
+        const distinctStrings = async (collection, field, match = {}) => {
+          const docs = await collection
+            .aggregate([
+              {
+                $match: {
+                  ...match,
+                  [field]: { $exists: true, $ne: null, $ne: '' },
+                },
+              },
+              { $group: { _id: `$${field}` } },
+            ])
+            .toArray();
+          return docs.map((d) => String(d._id || '').trim()).filter(Boolean);
+        };
+
+        const [clientRoleUids, jobClientIds, browseClientIds, browsePostedByUids] = await Promise.all([
+          distinctStrings(usersCollection, 'uid', { role: 'client' }),
+          distinctStrings(jobsCollection, 'clientId'),
+          distinctStrings(browseJobsCollection, 'clientId'),
+          distinctStrings(browseJobsCollection, 'postedByUid'),
+        ]);
+
+        const uidSet = new Set(
+          [...clientRoleUids, ...jobClientIds, ...browseClientIds, ...browsePostedByUids]
+            .map((x) => (x == null ? '' : String(x).trim()))
+            .filter(Boolean)
+        );
+        const allUids = Array.from(uidSet);
+
+        const query = { uid: { $in: allUids } };
+        const [list, total] = await Promise.all([
+          usersCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          usersCollection.countDocuments(query),
+        ]);
+
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/customers failed:', err);
+        res.status(500).json({ error: 'Failed to fetch customers' });
+      }
+    });
+
+    app.get('/api/admin/customers/:uid', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const doc = await usersCollection.findOne({ uid });
+        if (!doc) return res.status(404).json({ error: 'Customer not found' });
+        const stats = await computeUserStats(uid);
+        res.json({ ...doc, stats: stats || {} });
+      } catch (err) {
+        console.error('GET /api/admin/customers/:uid failed:', err);
+        res.status(500).json({ error: 'Failed to fetch customer' });
+      }
+    });
+
+    app.get('/api/admin/customers/:uid/transactions', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          transactionsCollection.find({ userId: uid }).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          transactionsCollection.countDocuments({ userId: uid }),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/customers/:uid/transactions failed:', err);
+        res.status(500).json({ error: 'Failed to fetch transactions' });
+      }
+    });
+
+    app.get('/api/admin/customers/:uid/addresses', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const doc = await usersCollection.findOne({ uid });
+        if (!doc) return res.status(404).json({ error: 'Customer not found' });
+        const addresses = Array.isArray(doc.addresses) ? doc.addresses : [];
+        res.json({ list: addresses });
+      } catch (err) {
+        console.error('GET /api/admin/customers/:uid/addresses failed:', err);
+        res.status(500).json({ error: 'Failed to fetch addresses' });
+      }
+    });
+
+    // -------- Admin: Support - User queries --------
+    app.get('/api/admin/support/queries', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          userQueriesCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          userQueriesCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/support/queries failed:', err);
+        res.status(500).json({ error: 'Failed to fetch queries' });
+      }
+    });
+
+    app.patch('/api/admin/support/queries/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const { status } = req.body || {};
+        const statusIn = String(status || '').toLowerCase();
+        if (!['open', 'closed'].includes(statusIn)) return res.status(400).json({ error: 'Invalid status' });
+        const result = await userQueriesCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: statusIn, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true, status: statusIn });
+      } catch (err) {
+        console.error('PATCH /api/admin/support/queries/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: Support - Chat (conversations metadata) --------
+    app.get('/api/admin/support/chat', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const pipeline = [
+          { $group: { _id: '$conversationId', lastMessage: { $max: '$createdAt' }, count: { $sum: 1 } } },
+          { $sort: { lastMessage: -1 } },
+          { $skip: skip },
+          { $limit: limit },
+        ];
+        const list = await messagesCollection.aggregate(pipeline).toArray();
+        const total = await messagesCollection.distinct('conversationId').then((arr) => arr.length);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/support/chat failed:', err);
+        res.status(500).json({ error: 'Failed to fetch chat threads' });
+      }
+    });
+
+    // -------- Admin: Support - Reporting reasons --------
+    app.get('/api/admin/support/reporting-reasons', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await reportingReasonsCollection.find({}).sort({ order: 1, name: 1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/support/reporting-reasons failed:', err);
+        res.status(500).json({ error: 'Failed to fetch reporting reasons' });
+      }
+    });
+
+    app.post('/api/admin/support/reporting-reasons', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          name: String(body.name || '').trim(),
+          order: Number(body.order) || 0,
+          isActive: body.isActive !== false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await reportingReasonsCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/support/reporting-reasons failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/support/reporting-reasons/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.name !== undefined) $set.name = String(body.name).trim();
+        if (typeof body.order === 'number') $set.order = body.order;
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        const result = await reportingReasonsCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/support/reporting-reasons failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.delete('/api/admin/support/reporting-reasons/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await reportingReasonsCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/support/reporting-reasons/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: Support - Blocked users --------
+    app.get('/api/admin/support/blocked-users', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          blockedUsersCollection.find({}).sort({ blockedAt: -1 }).skip(skip).limit(limit).toArray(),
+          blockedUsersCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/support/blocked-users failed:', err);
+        res.status(500).json({ error: 'Failed to fetch blocked users' });
+      }
+    });
+
+    app.post('/api/admin/support/blocked-users', authenticateAdmin, async (req, res) => {
+      try {
+        const { userId, reason } = req.body || {};
+        const doc = {
+          userId: String(userId || ''),
+          reason: String(reason || '').trim(),
+          blockedAt: new Date(),
+        };
+        const result = await blockedUsersCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/support/blocked-users failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.delete('/api/admin/support/blocked-users/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await blockedUsersCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/support/blocked-users/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: Support tickets (chat) --------
+    app.get('/api/admin/support/tickets', authenticateAdmin, async (req, res) => {
+      try {
+        const role = req.query.role; // client | worker
+        const status = req.query.status; // open | closed
+        const q = String(req.query.q || '').trim();
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const query = {};
+        if (role === 'client' || role === 'worker') query.userRole = role;
+        if (status === 'open' || status === 'closed') query.status = status;
+        if (q) {
+          const orConditions = [
+            { subject: { $regex: q, $options: 'i' } },
+            { lastMessagePreview: { $regex: q, $options: 'i' } },
+          ];
+          const uids = await usersCollection
+            .aggregate([
+              {
+                $match: {
+                  $or: [
+                    { displayName: { $regex: q, $options: 'i' } },
+                    { email: { $regex: q, $options: 'i' } },
+                    { firstName: { $regex: q, $options: 'i' } },
+                    { lastName: { $regex: q, $options: 'i' } },
+                  ],
+                },
+              },
+              { $group: { _id: '$uid' } },
+            ])
+            .toArray();
+          const uidList = (uids || []).map((d) => d._id).filter(Boolean);
+          if (uidList.length) orConditions.push({ userId: { $in: uidList } });
+          query.$or = orConditions;
+        }
+        const [list, total] = await Promise.all([
+          supportTicketsCollection.find(query).sort({ lastMessageAt: -1 }).skip(skip).limit(limit).toArray(),
+          supportTicketsCollection.countDocuments(query),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/support/tickets failed:', err);
+        res.status(500).json({ error: 'Failed to list tickets' });
+      }
+    });
+
+    app.get('/api/admin/support/tickets/:ticketId/messages', authenticateAdmin, async (req, res) => {
+      try {
+        const ticketId = req.params.ticketId;
+        if (!ObjectId.isValid(ticketId)) return res.status(400).json({ error: 'Invalid ticket id' });
+        const ticket = await supportTicketsCollection.findOne({ _id: new ObjectId(ticketId) });
+        if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+        const messages = await supportMessagesCollection
+          .find({ ticketId: new ObjectId(ticketId) })
+          .sort({ createdAt: 1 })
+          .toArray();
+        const userMsgIds = messages.filter((m) => m.senderType === 'user').map((m) => m._id);
+        if (userMsgIds.length) {
+          await supportMessagesCollection.updateMany(
+            { _id: { $in: userMsgIds } },
+            { $set: { readByAdmin: true } }
+          );
+        }
+        await supportTicketsCollection.updateOne(
+          { _id: new ObjectId(ticketId) },
+          { $set: { unreadForAdmin: 0, updatedAt: new Date() } }
+        );
+        const updatedTicket = await supportTicketsCollection.findOne({ _id: new ObjectId(ticketId) });
+        const updatedMessages = await supportMessagesCollection
+          .find({ ticketId: new ObjectId(ticketId) })
+          .sort({ createdAt: 1 })
+          .toArray();
+        res.json({ ticket: updatedTicket, messages: updatedMessages });
+      } catch (err) {
+        console.error('GET /api/admin/support/tickets/:ticketId/messages failed:', err);
+        res.status(500).json({ error: 'Failed to load messages' });
+      }
+    });
+
+    app.post('/api/admin/support/tickets/:ticketId/messages', authenticateAdmin, async (req, res) => {
+      try {
+        const ticketId = req.params.ticketId;
+        const message = String(req.body?.message || '').trim();
+        if (!message) return res.status(400).json({ error: 'Message required' });
+        if (!ObjectId.isValid(ticketId)) return res.status(400).json({ error: 'Invalid ticket id' });
+        const ticket = await supportTicketsCollection.findOne({ _id: new ObjectId(ticketId) });
+        if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+        const now = new Date();
+        const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
+        const msgDoc = {
+          ticketId: new ObjectId(ticketId),
+          senderType: 'admin',
+          senderId: req.user?.uid || '',
+          message,
+          createdAt: now,
+          readByUser: false,
+          readByAdmin: true,
+        };
+        const result = await supportMessagesCollection.insertOne(msgDoc);
+        await supportTicketsCollection.updateOne(
+          { _id: new ObjectId(ticketId) },
+          {
+            $set: {
+              lastMessageAt: now,
+              lastMessagePreview: preview,
+              updatedAt: now,
+              unreadForUser: (ticket.unreadForUser || 0) + 1,
+            },
+          }
+        );
+        res.status(201).json({ message: { ...msgDoc, _id: result.insertedId } });
+      } catch (err) {
+        console.error('POST /api/admin/support/tickets/:ticketId/messages failed:', err);
+        res.status(500).json({ error: 'Failed to send message' });
+      }
+    });
+
+    app.patch('/api/admin/support/tickets/:ticketId', authenticateAdmin, async (req, res) => {
+      try {
+        const ticketId = req.params.ticketId;
+        if (!ObjectId.isValid(ticketId)) return res.status(400).json({ error: 'Invalid ticket id' });
+        const status = req.body?.status; // open | closed
+        if (status !== 'open' && status !== 'closed') return res.status(400).json({ error: 'status must be open or closed' });
+        const result = await supportTicketsCollection.updateOne(
+          { _id: new ObjectId(ticketId) },
+          { $set: { status, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Ticket not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/support/tickets/:ticketId failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: Promo codes --------
+    app.get('/api/admin/promo/codes', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await promoCodesCollection.find({}).sort({ createdAt: -1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/promo/codes failed:', err);
+        res.status(500).json({ error: 'Failed to fetch promo codes' });
+      }
+    });
+
+    app.post('/api/admin/promo/codes', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          code: String(body.code || '').trim().toUpperCase(),
+          discountType: ['percent', 'fixed'].includes(body.discountType) ? body.discountType : 'percent',
+          discountValue: Number(body.discountValue) || 0,
+          validFrom: body.validFrom ? new Date(body.validFrom) : new Date(),
+          validUntil: body.validUntil ? new Date(body.validUntil) : null,
+          maxUses: Number(body.maxUses) || null,
+          usedCount: 0,
+          isActive: body.isActive !== false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await promoCodesCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/promo/codes failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/promo/codes/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.code !== undefined) $set.code = String(body.code).trim().toUpperCase();
+        if (['percent', 'fixed'].includes(body.discountType)) $set.discountType = body.discountType;
+        if (typeof body.discountValue === 'number') $set.discountValue = body.discountValue;
+        if (body.validFrom !== undefined) $set.validFrom = new Date(body.validFrom);
+        if (body.validUntil !== undefined) $set.validUntil = body.validUntil ? new Date(body.validUntil) : null;
+        if (typeof body.maxUses === 'number') $set.maxUses = body.maxUses;
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        const result = await promoCodesCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/promo/codes/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.delete('/api/admin/promo/codes/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await promoCodesCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/promo/codes/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: Notifications (broadcast queue) --------
+    app.get('/api/admin/promo/notifications', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          notificationsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          notificationsCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/promo/notifications failed:', err);
+        res.status(500).json({ error: 'Failed to fetch notifications' });
+      }
+    });
+
+    // -------- Admin: Email (campaign metadata) - stub --------
+    app.get('/api/admin/promo/email', authenticateAdmin, async (req, res) => {
+      try {
+        res.json({ list: [], message: 'Email campaign triggers - integrate with your email provider' });
+      } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch email campaigns' });
+      }
+    });
+
+    // -------- Admin: Home CMS - Sliders --------
+    app.get('/api/admin/home/sliders', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await slidersCollection.find({}).sort({ order: 1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/home/sliders failed:', err);
+        res.status(500).json({ error: 'Failed to fetch sliders' });
+      }
+    });
+
+    app.post('/api/admin/home/sliders', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          title: String(body.title || '').trim(),
+          imageUrl: String(body.imageUrl || '').trim(),
+          linkUrl: String(body.linkUrl || '').trim(),
+          order: Number(body.order) || 0,
+          isActive: body.isActive !== false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await slidersCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/home/sliders failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/home/sliders/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.title !== undefined) $set.title = String(body.title).trim();
+        if (body.imageUrl !== undefined) $set.imageUrl = String(body.imageUrl).trim();
+        if (body.linkUrl !== undefined) $set.linkUrl = String(body.linkUrl).trim();
+        if (typeof body.order === 'number') $set.order = body.order;
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        const result = await slidersCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/home/sliders/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.delete('/api/admin/home/sliders/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await slidersCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/home/sliders/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: Home CMS - Featured section --------
+    app.get('/api/admin/home/featured', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await featuredSectionCollection.find({}).sort({ order: 1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/home/featured failed:', err);
+        res.status(500).json({ error: 'Failed to fetch featured' });
+      }
+    });
+
+    app.post('/api/admin/home/featured', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          title: String(body.title || '').trim(),
+          subtitle: String(body.subtitle || '').trim(),
+          imageUrl: String(body.imageUrl || '').trim(),
+          linkUrl: String(body.linkUrl || '').trim(),
+          order: Number(body.order) || 0,
+          isActive: body.isActive !== false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await featuredSectionCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/home/featured failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/home/featured/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.title !== undefined) $set.title = String(body.title).trim();
+        if (body.subtitle !== undefined) $set.subtitle = String(body.subtitle).trim();
+        if (body.imageUrl !== undefined) $set.imageUrl = String(body.imageUrl).trim();
+        if (body.linkUrl !== undefined) $set.linkUrl = String(body.linkUrl).trim();
+        if (typeof body.order === 'number') $set.order = body.order;
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        const result = await featuredSectionCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/home/featured/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.delete('/api/admin/home/featured/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await featuredSectionCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/home/featured/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: Subscription plans --------
+    app.get('/api/admin/subscription/plans', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await subscriptionPlansCollection.find({}).sort({ order: 1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/subscription/plans failed:', err);
+        res.status(500).json({ error: 'Failed to fetch plans' });
+      }
+    });
+
+    app.post('/api/admin/subscription/plans', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          name: String(body.name || '').trim(),
+          price: Number(body.price) || 0,
+          interval: ['month', 'year'].includes(body.interval) ? body.interval : 'month',
+          features: Array.isArray(body.features) ? body.features : [],
+          isActive: body.isActive !== false,
+          order: Number(body.order) || 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await subscriptionPlansCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/subscription/plans failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/subscription/plans/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.name !== undefined) $set.name = String(body.name).trim();
+        if (typeof body.price === 'number') $set.price = body.price;
+        if (['month', 'year'].includes(body.interval)) $set.interval = body.interval;
+        if (Array.isArray(body.features)) $set.features = body.features;
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        if (typeof body.order === 'number') $set.order = body.order;
+        const result = await subscriptionPlansCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/subscription/plans/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.get('/api/admin/subscription/subscriptions', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          userSubscriptionsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          userSubscriptionsCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/subscription/subscriptions failed:', err);
+        res.status(500).json({ error: 'Failed to fetch subscriptions' });
+      }
+    });
+
+    // -------- Admin: Media - Gallery --------
+    app.get('/api/admin/media/gallery', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          galleryCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          galleryCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/media/gallery failed:', err);
+        res.status(500).json({ error: 'Failed to fetch gallery' });
+      }
+    });
+
+    app.post('/api/admin/media/gallery', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          url: String(body.url || '').trim(),
+          caption: String(body.caption || '').trim(),
+          category: String(body.category || '').trim(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await galleryCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/media/gallery failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.delete('/api/admin/media/gallery/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await galleryCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/media/gallery/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: System - FAQs --------
+    app.get('/api/admin/system/faqs', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await faqsCollection.find({}).sort({ order: 1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/system/faqs failed:', err);
+        res.status(500).json({ error: 'Failed to fetch FAQs' });
+      }
+    });
+
+    app.post('/api/admin/system/faqs', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          question: String(body.question || '').trim(),
+          answer: String(body.answer || '').trim(),
+          order: Number(body.order) || 0,
+          isActive: body.isActive !== false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await faqsCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/system/faqs failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/system/faqs/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (body.question !== undefined) $set.question = String(body.question).trim();
+        if (body.answer !== undefined) $set.answer = String(body.answer).trim();
+        if (typeof body.order === 'number') $set.order = body.order;
+        if (typeof body.isActive === 'boolean') $set.isActive = body.isActive;
+        const result = await faqsCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/system/faqs/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.delete('/api/admin/system/faqs/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await faqsCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/system/faqs/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: System - System users (adminUsers) --------
+    app.get('/api/admin/system/users', authenticateAdmin, async (req, res) => {
+      try {
+        const list = await adminUsersCollection.find({}).sort({ createdAt: -1 }).toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/admin/system/users failed:', err);
+        res.status(500).json({ error: 'Failed to fetch system users' });
+      }
+    });
+
+    app.post('/api/admin/system/users', authenticateAdmin, async (req, res) => {
+      try {
+        const body = req.body || {};
+        const doc = {
+          uid: String(body.uid || '').trim(),
+          email: String(body.email || '').trim().toLowerCase(),
+          permissions: Array.isArray(body.permissions) ? body.permissions : ['*'],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        if (!doc.uid) return res.status(400).json({ error: 'uid required' });
+        const result = await adminUsersCollection.insertOne(doc);
+        res.status(201).json({ id: result.insertedId, ...doc });
+      } catch (err) {
+        console.error('POST /api/admin/system/users failed:', err);
+        res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/system/users/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const body = req.body || {};
+        const $set = { updatedAt: new Date() };
+        if (Array.isArray(body.permissions)) $set.permissions = body.permissions;
+        const result = await adminUsersCollection.updateOne({ _id: new ObjectId(id) }, { $set });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('PATCH /api/admin/system/users/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    app.delete('/api/admin/system/users/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await adminUsersCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('DELETE /api/admin/system/users/:id failed:', err);
+        res.status(500).json({ error: 'Delete failed' });
+      }
+    });
+
+    // -------- Admin: System - Database backup (metadata only) --------
+    app.get('/api/admin/system/backup', authenticateAdmin, async (req, res) => {
+      try {
+        res.json({ list: [], message: 'Backup metadata - integrate with your backup solution' });
+      } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch backups' });
+      }
+    });
+
+    app.post('/api/admin/system/backup', authenticateAdmin, adminRateLimiter('admin_backup', ADMIN_BACKUP_MAX), async (req, res) => {
+      try {
+        await logAdminAction(req, 'backup_trigger', 'system', {});
+        res.json({ ok: true, message: 'Backup triggered - integrate with your backup solution' });
+      } catch (err) {
+        res.status(500).json({ error: 'Backup trigger failed' });
+      }
+    });
+
     app.get('/', (_req, res) => {
       res.send('🚀 HireMistri API is running...');
     });
@@ -829,6 +2291,138 @@ async function startServer() {
       } catch (err) {
         console.error('GET /api/users/:uid/contact failed:', err);
         res.status(500).json({ error: 'Failed to fetch contact' });
+      }
+    });
+
+    // -------- Support tickets (user-facing: ClientSide + WorkerSide) --------
+    app.post('/api/support/tickets', authenticateUser, async (req, res) => {
+      try {
+        const uid = String(req.user?.uid || '').trim();
+        if (!uid) return res.status(401).json({ error: 'Authentication required' });
+        const userDoc = await usersCollection.findOne({ uid });
+        const userRole = (userDoc?.role === 'worker') ? 'worker' : 'client';
+        const subject = String(req.body?.subject || '').trim();
+        const message = String(req.body?.message || '').trim();
+        if (!subject || !message) return res.status(400).json({ error: 'Subject and message required' });
+        const now = new Date();
+        const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
+        const ticket = {
+          userId: uid,
+          userRole,
+          subject,
+          status: 'open',
+          createdAt: now,
+          updatedAt: now,
+          lastMessageAt: now,
+          lastMessagePreview: preview,
+          unreadForAdmin: 1,
+          unreadForUser: 0,
+        };
+        const result = await supportTicketsCollection.insertOne(ticket);
+        const msgDoc = {
+          ticketId: result.insertedId,
+          senderType: 'user',
+          senderId: uid,
+          message,
+          createdAt: now,
+          readByUser: true,
+          readByAdmin: false,
+        };
+        await supportMessagesCollection.insertOne(msgDoc);
+        res.status(201).json({ ticket: { ...ticket, _id: result.insertedId }, messageId: msgDoc._id });
+      } catch (err) {
+        console.error('POST /api/support/tickets failed:', err);
+        res.status(500).json({ error: 'Failed to create ticket' });
+      }
+    });
+
+    app.get('/api/support/tickets', authenticateUser, async (req, res) => {
+      try {
+        const uid = String(req.user?.uid || '').trim();
+        if (!uid) return res.status(401).json({ error: 'Authentication required' });
+        const status = req.query.status; // optional: open | closed
+        const query = { userId: uid };
+        if (status === 'open' || status === 'closed') query.status = status;
+        const list = await supportTicketsCollection
+          .find(query)
+          .sort({ lastMessageAt: -1 })
+          .toArray();
+        res.json({ list });
+      } catch (err) {
+        console.error('GET /api/support/tickets failed:', err);
+        res.status(500).json({ error: 'Failed to list tickets' });
+      }
+    });
+
+    app.get('/api/support/tickets/:ticketId/messages', authenticateUser, async (req, res) => {
+      try {
+        const uid = String(req.user?.uid || '').trim();
+        const ticketId = req.params.ticketId;
+        if (!ObjectId.isValid(ticketId)) return res.status(400).json({ error: 'Invalid ticket id' });
+        const ticket = await supportTicketsCollection.findOne({ _id: new ObjectId(ticketId) });
+        if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+        if (ticket.userId !== uid) return res.status(403).json({ error: 'Not your ticket' });
+        const messages = await supportMessagesCollection
+          .find({ ticketId: new ObjectId(ticketId) })
+          .sort({ createdAt: 1 })
+          .toArray();
+        // Mark admin->user messages as read by user
+        const adminMsgIds = messages.filter((m) => m.senderType === 'admin').map((m) => m._id);
+        if (adminMsgIds.length) {
+          await supportMessagesCollection.updateMany(
+            { _id: { $in: adminMsgIds } },
+            { $set: { readByUser: true } }
+          );
+        }
+        await supportTicketsCollection.updateOne(
+          { _id: new ObjectId(ticketId) },
+          { $set: { unreadForUser: 0, updatedAt: new Date() } }
+        );
+        res.json({ ticket, messages });
+      } catch (err) {
+        console.error('GET /api/support/tickets/:ticketId/messages failed:', err);
+        res.status(500).json({ error: 'Failed to load messages' });
+      }
+    });
+
+    app.post('/api/support/tickets/:ticketId/messages', authenticateUser, async (req, res) => {
+      try {
+        const uid = String(req.user?.uid || '').trim();
+        const ticketId = req.params.ticketId;
+        const message = String(req.body?.message || '').trim();
+        if (!message) return res.status(400).json({ error: 'Message required' });
+        if (!ObjectId.isValid(ticketId)) return res.status(400).json({ error: 'Invalid ticket id' });
+        const ticket = await supportTicketsCollection.findOne({ _id: new ObjectId(ticketId) });
+        if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+        if (ticket.userId !== uid) return res.status(403).json({ error: 'Not your ticket' });
+        if (ticket.status === 'closed') return res.status(400).json({ error: 'Ticket is closed' });
+        const now = new Date();
+        const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
+        const msgDoc = {
+          ticketId: new ObjectId(ticketId),
+          senderType: 'user',
+          senderId: uid,
+          message,
+          createdAt: now,
+          readByUser: true,
+          readByAdmin: false,
+        };
+        const result = await supportMessagesCollection.insertOne(msgDoc);
+        await supportTicketsCollection.updateOne(
+          { _id: new ObjectId(ticketId) },
+          {
+            $set: {
+              lastMessageAt: now,
+              lastMessagePreview: preview,
+              updatedAt: now,
+              unreadForAdmin: (ticket.unreadForAdmin || 0) + 1,
+            },
+          }
+        );
+        res.status(201).json({ message: { ...msgDoc, _id: result.insertedId } });
+      } catch (err) {
+        console.error('POST /api/support/tickets/:ticketId/messages failed:', err);
+        res.status(500).json({ error: 'Failed to send message' });
       }
     });
 
