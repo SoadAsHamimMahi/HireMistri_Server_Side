@@ -428,7 +428,13 @@ async function startServer() {
     // Reviews indexes
     await reviewsCollection.createIndex({ workerId: 1, createdAt: -1 });
     await reviewsCollection.createIndex({ jobId: 1 });
-    await reviewsCollection.createIndex({ applicationId: 1 }, { unique: true, sparse: true });
+    // Migrate old one-review-per-application index to allow both client and worker reviews.
+    try {
+      await reviewsCollection.dropIndex('applicationId_1');
+    } catch (e) {
+      // Ignore if index doesn't exist.
+    }
+    await reviewsCollection.createIndex({ applicationId: 1, reviewerId: 1 }, { unique: true, sparse: true });
     await reviewsCollection.createIndex({ clientId: 1, workerId: 1 });
 
     // BrowseJobs indexes for private jobs
@@ -777,7 +783,12 @@ async function startServer() {
       };
       
       if (userRole === 'worker') {
-        const reviews = await reviewsCollection.find({ workerId: safeUid }).toArray();
+        const reviews = await reviewsCollection.find({
+          $or: [
+            { revieweeId: safeUid, revieweeRole: 'worker' },
+            { workerId: safeUid, revieweeRole: { $exists: false } }, // legacy docs
+          ]
+        }).toArray();
         if (reviews.length > 0) {
           // Calculate average overall rating
           const totalRating = reviews.reduce((sum, r) => sum + (r.overallRating || 0), 0);
@@ -814,7 +825,14 @@ async function startServer() {
         totalJobsPosted,
         averageRating,
         categoryRatings: userRole === 'worker' ? categoryRatings : null,
-        totalReviews: userRole === 'worker' ? await reviewsCollection.countDocuments({ workerId: safeUid }) : 0,
+        totalReviews: userRole === 'worker'
+          ? await reviewsCollection.countDocuments({
+              $or: [
+                { revieweeId: safeUid, revieweeRole: 'worker' },
+                { workerId: safeUid, revieweeRole: { $exists: false } },
+              ]
+            })
+          : 0,
       };
 
       // Client stats (include when user has posted jobs, regardless of role)
@@ -2905,12 +2923,13 @@ async function startServer() {
         // Price bargaining fields
         if ('proposedPrice' in b) {
           const price = parseFloat(b.proposedPrice);
-          if (!isNaN(price) && price > 0) {
-            setIf('proposedPrice', price);
-            // Set negotiation status if not already set
-            if (!existing?.negotiationStatus || existing.negotiationStatus === 'none') {
-              setIf('negotiationStatus', 'pending');
-            }
+          if (isNaN(price) || price <= 0) {
+            return res.status(400).json({ error: 'proposedPrice must be a positive number' });
+          }
+          setIf('proposedPrice', price);
+          // Set negotiation status if not already set
+          if (!existing?.negotiationStatus || existing.negotiationStatus === 'none') {
+            setIf('negotiationStatus', 'pending');
           }
         }
         if ('counterPrice' in b) {
@@ -2931,6 +2950,19 @@ async function startServer() {
           const status = s(b.negotiationStatus);
           if (['none', 'pending', 'countered', 'accepted', 'cancelled'].includes(status)) {
             setIf('negotiationStatus', status);
+          }
+        }
+
+        // For new worker applications, require proposal text and proposed price.
+        const requestedStatus = s(b.status) || 'pending';
+        if (isNew && requestedStatus === 'pending') {
+          const proposalTextIn = s(b.proposalText || b.text);
+          const proposedPriceIn = parseFloat(b.proposedPrice);
+          if (!proposalTextIn) {
+            return res.status(400).json({ error: 'proposalText is required for application' });
+          }
+          if (isNaN(proposedPriceIn) || proposedPriceIn <= 0) {
+            return res.status(400).json({ error: 'proposedPrice is required for application' });
           }
         }
 
@@ -3183,6 +3215,9 @@ async function startServer() {
               negotiationStatus: 1,
               counterPrice: 1,
               finalPrice: 1,
+              completedByClientAt: 1,
+              completedByWorkerAt: 1,
+              completedAt: 1,
               currency: 1,
               title: '$jobDoc.title',
               location: '$jobDoc.location',
@@ -3287,6 +3322,9 @@ async function startServer() {
               negotiationStatus: 1,
               counterPrice: 1,
               finalPrice: 1,
+              completedByClientAt: 1,
+              completedByWorkerAt: 1,
+              completedAt: 1,
               currency: 1,
               workerName: 1,
               workerEmail: 1,
@@ -3333,15 +3371,59 @@ async function startServer() {
       try {
         const { id } = req.params;
         const statusIn = String(req.body?.status || '').toLowerCase().trim();
+        const actorRole = String(req.body?.actorRole || '').toLowerCase().trim();
         const allowed = new Set(['pending', 'accepted', 'rejected', 'completed']);
 
         if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid application id' });
         if (!allowed.has(statusIn)) return res.status(400).json({ error: 'Invalid status' });
 
         const _id = new ObjectId(id);
+        const oldDoc = await applicationsCollection.findOne({ _id });
+        if (!oldDoc) return res.status(404).json({ error: 'Application not found' });
+
+        if (statusIn === 'accepted') {
+          const hasProposedPrice = oldDoc.proposedPrice != null;
+          const hasFinalPrice = oldDoc.finalPrice != null && Number(oldDoc.finalPrice) > 0;
+          const negotiationAccepted = String(oldDoc.negotiationStatus || '').toLowerCase() === 'accepted';
+          if (hasProposedPrice && !hasFinalPrice && !negotiationAccepted) {
+            return res.status(400).json({ error: 'Finalize price negotiation before accepting this application' });
+          }
+        }
+
+        const now = new Date();
+        const updateFields = { updatedAt: now };
+        let resolvedStatus = statusIn;
+
+        if (statusIn === 'completed') {
+          const oldStatus = String(oldDoc.status || '').toLowerCase();
+          if (!['accepted', 'completed'].includes(oldStatus)) {
+            return res.status(400).json({ error: 'Only accepted applications can be marked complete' });
+          }
+          if (!['client', 'worker'].includes(actorRole)) {
+            return res.status(400).json({ error: 'actorRole must be either client or worker for completion' });
+          }
+
+          if (actorRole === 'client' && !oldDoc.completedByClientAt) {
+            updateFields.completedByClientAt = now;
+          }
+          if (actorRole === 'worker' && !oldDoc.completedByWorkerAt) {
+            updateFields.completedByWorkerAt = now;
+          }
+
+          const clientCompleted = !!(oldDoc.completedByClientAt || updateFields.completedByClientAt);
+          const workerCompleted = !!(oldDoc.completedByWorkerAt || updateFields.completedByWorkerAt);
+          resolvedStatus = clientCompleted && workerCompleted ? 'completed' : 'accepted';
+          updateFields.status = resolvedStatus;
+          if (resolvedStatus === 'completed') {
+            updateFields.completedAt = now;
+          }
+        } else {
+          updateFields.status = statusIn;
+        }
+
         const upd = await applicationsCollection.updateOne(
           { _id },
-          { $set: { status: statusIn, updatedAt: new Date() } }
+          { $set: updateFields }
         );
 
         if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
@@ -3360,6 +3442,7 @@ async function startServer() {
       try {
         const { id } = req.params;
         const statusIn = String(req.body?.status || '').toLowerCase().trim();
+        const actorRole = String(req.body?.actorRole || '').toLowerCase().trim();
         const allowed = new Set(['pending', 'accepted', 'rejected', 'completed']);
 
         if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid application id' });
@@ -3372,13 +3455,52 @@ async function startServer() {
         if (!oldDoc) {
           return res.status(404).json({ error: 'Application not found' });
         }
+
+        if (statusIn === 'accepted') {
+          const hasProposedPrice = oldDoc.proposedPrice != null;
+          const hasFinalPrice = oldDoc.finalPrice != null && Number(oldDoc.finalPrice) > 0;
+          const negotiationAccepted = String(oldDoc.negotiationStatus || '').toLowerCase() === 'accepted';
+          if (hasProposedPrice && !hasFinalPrice && !negotiationAccepted) {
+            return res.status(400).json({ error: 'Finalize price negotiation before accepting this application' });
+          }
+        }
         
         const oldStatus = (oldDoc.status || 'pending').toLowerCase();
-        const statusChanged = oldStatus !== statusIn;
+        const now = new Date();
+        const updateFields = { updatedAt: now };
+        let resolvedStatus = statusIn;
+
+        if (statusIn === 'completed') {
+          if (!['accepted', 'completed'].includes(oldStatus)) {
+            return res.status(400).json({ error: 'Only accepted applications can be marked complete' });
+          }
+          if (!['client', 'worker'].includes(actorRole)) {
+            return res.status(400).json({ error: 'actorRole must be either client or worker for completion' });
+          }
+
+          if (actorRole === 'client' && !oldDoc.completedByClientAt) {
+            updateFields.completedByClientAt = now;
+          }
+          if (actorRole === 'worker' && !oldDoc.completedByWorkerAt) {
+            updateFields.completedByWorkerAt = now;
+          }
+
+          const clientCompleted = !!(oldDoc.completedByClientAt || updateFields.completedByClientAt);
+          const workerCompleted = !!(oldDoc.completedByWorkerAt || updateFields.completedByWorkerAt);
+          resolvedStatus = clientCompleted && workerCompleted ? 'completed' : 'accepted';
+          updateFields.status = resolvedStatus;
+          if (resolvedStatus === 'completed') {
+            updateFields.completedAt = now;
+          }
+        } else {
+          updateFields.status = statusIn;
+        }
+
+        const statusChanged = oldStatus !== resolvedStatus;
         
         const upd = await applicationsCollection.updateOne(
           { _id },
-          { $set: { status: statusIn, updatedAt: new Date() } }
+          { $set: updateFields }
         );
 
         if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
@@ -3386,7 +3508,7 @@ async function startServer() {
         const doc = await applicationsCollection.findOne({ _id });
         
         // Send email notification and create in-app notification to worker if status changed to accepted/rejected
-        if (statusChanged && (statusIn === 'accepted' || statusIn === 'rejected')) {
+        if (statusChanged && (resolvedStatus === 'accepted' || resolvedStatus === 'rejected')) {
           try {
             // Get job details
             let jobTitle = 'the job';
@@ -3413,12 +3535,12 @@ async function startServer() {
             
             // Create in-app notification
             if (doc.workerId) {
-              const statusText = statusIn === 'accepted' ? 'accepted' : 'rejected';
+              const statusText = resolvedStatus === 'accepted' ? 'accepted' : 'rejected';
               await createNotification(
                 doc.workerId,
                 `Application ${statusText.charAt(0).toUpperCase() + statusText.slice(1)}`,
                 `Your application for "${jobTitle}" has been ${statusText}.`,
-                statusIn === 'accepted' ? 'success' : 'info',
+                resolvedStatus === 'accepted' ? 'success' : 'info',
                 doc.jobId,
                 `/jobs/${doc.jobId}`
               );
@@ -3426,7 +3548,7 @@ async function startServer() {
             
             if (workerEmail) {
               // Send email asynchronously (don't block response)
-              sendApplicationStatusEmail(workerEmail, workerName, jobTitle, statusIn)
+              sendApplicationStatusEmail(workerEmail, workerName, jobTitle, resolvedStatus)
                 .catch(err => console.error('Failed to send application status email:', err));
             }
 
@@ -3435,7 +3557,7 @@ async function startServer() {
               const conversationId = await findOrCreateConversationId(doc.jobId, doc.clientId, doc.workerId);
               const reason = req.body.reason || req.body.message || null;
               
-              if (statusIn === 'accepted') {
+              if (resolvedStatus === 'accepted') {
                 // Get job details for a more informative message
                 let jobDetails = '';
                 try {
@@ -3475,7 +3597,7 @@ async function startServer() {
         }
 
         // Send system message when application is marked as completed
-        if (statusChanged && statusIn === 'completed') {
+        if (statusChanged && resolvedStatus === 'completed') {
           try {
             // Get job details
             let jobTitle = 'the job';
@@ -3790,14 +3912,32 @@ async function startServer() {
           applicationId,
           workerId,
           clientId,
+          reviewerId: reviewerIdIn,
+          reviewerRole: reviewerRoleIn,
+          revieweeId: revieweeIdIn,
+          revieweeRole: revieweeRoleIn,
           ratings,
           overallRating,
           reviewText
         } = req.body || {};
 
+        const reviewerRole = String(reviewerRoleIn || 'client').toLowerCase();
+        const reviewerId = String(reviewerIdIn || (reviewerRole === 'worker' ? workerId : clientId) || '').trim();
+        const revieweeRole = String(revieweeRoleIn || (reviewerRole === 'worker' ? 'client' : 'worker')).toLowerCase();
+        const revieweeId = String(revieweeIdIn || (revieweeRole === 'worker' ? workerId : clientId) || '').trim();
+
         // Validation
         if (!jobId || !applicationId || !workerId || !clientId) {
           return res.status(400).json({ error: 'Missing required fields: jobId, applicationId, workerId, clientId' });
+        }
+        if (!['client', 'worker'].includes(reviewerRole)) {
+          return res.status(400).json({ error: 'reviewerRole must be client or worker' });
+        }
+        if (!['client', 'worker'].includes(revieweeRole)) {
+          return res.status(400).json({ error: 'revieweeRole must be client or worker' });
+        }
+        if (!reviewerId || !revieweeId) {
+          return res.status(400).json({ error: 'reviewerId and revieweeId are required' });
         }
 
         if (!ratings || typeof ratings !== 'object') {
@@ -3826,10 +3966,24 @@ async function startServer() {
           }
         }
 
-        // Check if review already exists for this application
-        const existingReview = await reviewsCollection.findOne({ applicationId: String(applicationId) });
+        // Check if review already exists for this reviewer on this application
+        const existingReview = await reviewsCollection.findOne({
+          $or: [
+            {
+              applicationId: String(applicationId),
+              reviewerId: String(reviewerId),
+            },
+            {
+              applicationId: String(applicationId),
+              reviewerId: { $exists: false },
+              ...(reviewerRole === 'client'
+                ? { clientId: String(reviewerId) }
+                : { workerId: String(reviewerId) }),
+            },
+          ],
+        });
         if (existingReview) {
-          return res.status(409).json({ error: 'Review already exists for this application' });
+          return res.status(409).json({ error: 'You already reviewed this application' });
         }
 
         // Verify the application exists and is completed
@@ -3849,7 +4003,7 @@ async function startServer() {
           return res.status(400).json({ error: 'Can only review completed applications' });
         }
 
-        // Verify client owns the job
+        // Verify job exists
         let job;
         if (ObjectId.isValid(jobId)) {
           job = await browseJobsCollection.findOne({ _id: new ObjectId(jobId) });
@@ -3861,8 +4015,32 @@ async function startServer() {
           return res.status(404).json({ error: 'Job not found' });
         }
 
-        if (String(job.clientId) !== String(clientId)) {
-          return res.status(403).json({ error: 'You can only review workers for your own jobs' });
+        const normalizedClientId = String(clientId);
+        const normalizedWorkerId = String(workerId);
+        const normalizedReviewerId = String(reviewerId);
+        const normalizedRevieweeId = String(revieweeId);
+
+        if (reviewerRole === 'client') {
+          if (String(job.clientId) !== normalizedReviewerId) {
+            return res.status(403).json({ error: 'You can only review workers for your own jobs' });
+          }
+          if (normalizedRevieweeId !== normalizedWorkerId) {
+            return res.status(400).json({ error: 'Client review target must be the application worker' });
+          }
+        } else if (reviewerRole === 'worker') {
+          if (String(application.workerId || '') !== normalizedReviewerId) {
+            return res.status(403).json({ error: 'You can only review jobs you worked on' });
+          }
+          if (normalizedRevieweeId !== normalizedClientId) {
+            return res.status(400).json({ error: 'Worker review target must be the job client' });
+          }
+        }
+
+        if (normalizedClientId !== String(job.clientId || normalizedClientId)) {
+          return res.status(400).json({ error: 'clientId does not match the job owner' });
+        }
+        if (String(application.workerId || '') !== normalizedWorkerId) {
+          return res.status(400).json({ error: 'workerId does not match the application worker' });
         }
 
         // Create review document
@@ -3871,6 +4049,10 @@ async function startServer() {
           applicationId: String(applicationId),
           workerId: String(workerId),
           clientId: String(clientId),
+          reviewerId: normalizedReviewerId,
+          reviewerRole,
+          revieweeId: normalizedRevieweeId,
+          revieweeRole,
           ratings: {
             qualityOfWork: Number(ratings.qualityOfWork) || 0,
             punctuality: Number(ratings.punctuality) || 0,
@@ -3890,7 +4072,7 @@ async function startServer() {
         // Update user stats cache by triggering recomputation (will happen on next request)
         // For now, we'll let computeUserStats handle it on next fetch
 
-        // Send system message to worker about the review
+        // Send system message to the reviewed user about the review
         try {
           const conversationId = await findOrCreateConversationId(jobId, clientId, workerId);
           if (conversationId) {
@@ -3909,8 +4091,8 @@ async function startServer() {
             
             await sendSystemMessage(
               conversationId,
-              clientId,
-              workerId,
+              normalizedReviewerId,
+              normalizedRevieweeId,
               jobId,
               messageParts.join('\n')
             );
@@ -3940,7 +4122,12 @@ async function startServer() {
         const { limit = 10, skip = 0 } = req.query;
 
         const reviews = await reviewsCollection
-          .find({ workerId: String(workerId) })
+          .find({
+            $or: [
+              { revieweeId: String(workerId), revieweeRole: 'worker' },
+              { workerId: String(workerId), revieweeRole: { $exists: false } }, // legacy docs
+            ]
+          })
           .sort({ createdAt: -1 })
           .limit(parseInt(limit) || 10)
           .skip(parseInt(skip) || 0)
@@ -3988,7 +4175,10 @@ async function startServer() {
     app.get('/api/reviews/application/:applicationId', async (req, res) => {
       try {
         const { applicationId } = req.params;
-        const review = await reviewsCollection.findOne({ applicationId: String(applicationId) });
+        const reviewerId = String(req.query?.reviewerId || '').trim();
+        const query = { applicationId: String(applicationId) };
+        if (reviewerId) query.reviewerId = reviewerId;
+        const review = await reviewsCollection.findOne(query);
         
         if (!review) {
           return res.status(404).json({ error: 'Review not found' });
@@ -5303,6 +5493,10 @@ async function startServer() {
           if (isNaN(expirationDate.getTime())) {
             return res.status(400).json({ error: 'Invalid expiration date format' });
           }
+          // Date-only strings (YYYY-MM-DD) are parsed as midnight UTC — treat as end of that day
+          if (/^\d{4}-\d{2}-\d{2}$/.test(String(expiresAt))) {
+            expirationDate.setHours(23, 59, 59, 999);
+          }
           if (expirationDate <= new Date()) {
             return res.status(400).json({ error: 'Expiration date must be in the future' });
           }
@@ -5549,6 +5743,9 @@ async function startServer() {
             const expirationDate = new Date(req.body.expiresAt);
             if (isNaN(expirationDate.getTime())) {
               return res.status(400).json({ error: 'Invalid expiration date format' });
+            }
+            if (/^\d{4}-\d{2}-\d{2}$/.test(String(req.body.expiresAt))) {
+              expirationDate.setHours(23, 59, 59, 999);
             }
             if (expirationDate <= new Date()) {
               return res.status(400).json({ error: 'Expiration date must be in the future' });
