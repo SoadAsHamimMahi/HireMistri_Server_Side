@@ -610,7 +610,7 @@ async function startServer() {
     // build a $set from only allowed keys that are present on req.body
     function buildUserSet(body = {}) {
       const allowed = [
-        'firstName', 'lastName', 'displayName', 'phone', 'headline', 'bio',
+        'firstName', 'lastName', 'phone', 'headline', 'bio',
         'skills', 'isAvailable', 'profileCover', 'address1', 'address2',
         'city', 'country', 'zip', 'workExperience', 'role', 'email'
       ];
@@ -647,11 +647,8 @@ async function startServer() {
         const u = await usersCollection.findOne({ uid: workerId });
         if (u) {
           out.email = (u.email || out.email).toLowerCase().trim();
-          // prefer displayName, or fall back to first+last
-          const name =
-            u.displayName ||
-            [u.firstName, u.lastName].filter(Boolean).join(' ') ||
-            '';
+          // Prefer first+last name
+          const name = [u.firstName, u.lastName].filter(Boolean).join(' ') || '';
           out.name = (name || out.name).trim();
           out.phone = (u.phone || out.phone).trim();
           if (out.email && out.name && out.phone) return out;
@@ -3067,7 +3064,68 @@ async function startServer() {
       }
     });
 
+    // Get a single application by MongoDB _id
+    app.get('/api/applications/by-id/:id', async (req, res) => {
+      try {
+        const { ObjectId } = require('mongodb');
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid application ID' });
+        }
+
+        const application = await applicationsCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!application) {
+          return res.status(404).json({ error: 'Application not found' });
+        }
+
+        // Enrich with worker info
+        let workerInfo = null;
+        if (application.workerId) {
+          try {
+            const worker = await usersCollection.findOne({ uid: application.workerId });
+            if (worker) {
+              workerInfo = {
+                name: worker.displayName || [worker.firstName, worker.lastName].filter(Boolean).join(' ') || 'Unknown',
+                profileCover: worker.profileCover || null,
+                specialty: worker.specialty || worker.headline || null,
+                averageRating: worker.stats?.averageRating || null,
+              };
+            }
+          } catch {}
+        }
+
+        // Enrich with job info
+        let jobInfo = null;
+        if (application.jobId) {
+          try {
+            const { ObjectId: ObjId } = require('mongodb');
+            const job = ObjId.isValid(application.jobId)
+              ? await db.collection('browseJobs').findOne({ _id: new ObjId(application.jobId) })
+              : null;
+            if (job) {
+              jobInfo = {
+                title: job.title || 'Untitled Job',
+                description: job.description || '',
+                budget: job.budget || null,
+                category: job.category || null,
+                location: job.location || null,
+                deadline: job.deadline || null,
+              };
+            }
+          } catch {}
+        }
+
+        res.json({ ...application, workerInfo, jobInfo });
+      } catch (err) {
+        console.error('GET /api/applications/by-id/:id failed:', err);
+        res.status(500).json({ error: 'Failed to fetch application' });
+      }
+    });
+
     // Get a specific application by jobId and workerId
+
     app.get('/api/applications/:jobId/:workerId', async (req, res) => {
       try {
         const { jobId, workerId } = req.params;
