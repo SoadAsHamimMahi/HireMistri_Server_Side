@@ -9,6 +9,7 @@ const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
 const cron = require('node-cron');
+const SSLCommerzPayment = require('sslcommerz-lts');
 // Task 1.5: In-memory rate limiter for job offer endpoints (no package required)
 const jobOfferRateLimitStore = new Map(); // key -> { count, resetAt }
 const JOB_OFFER_RATE_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
@@ -267,6 +268,8 @@ let faqsCollection;
 let adminAuditLogCollection;
 let supportTicketsCollection;
 let supportMessagesCollection;
+let ledgersCollection;
+let additionalChargesCollection;
 
 // In-memory rate limit for admin sensitive operations
 const adminRateLimitStore = new Map();
@@ -380,6 +383,8 @@ async function startServer() {
     adminAuditLogCollection = db.collection('adminAuditLog');
     supportTicketsCollection = db.collection('supportTickets');
     supportMessagesCollection = db.collection('supportMessages');
+    ledgersCollection = db.collection('ledgers');
+    additionalChargesCollection = db.collection('additionalCharges');
 
     // ---------- indexes ----------
     await usersCollection.createIndex({ uid: 1 }, { unique: true, sparse: true });
@@ -446,7 +451,23 @@ async function startServer() {
     await workerJobRequestsCollection.createIndex({ workerId: 1, status: 1 });
     await workerJobRequestsCollection.createIndex({ clientId: 1, status: 1 });
 
-    // ---------- helpers ----------
+    // Registration status index
+    await usersCollection.createIndex({ workerAccountStatus: 1, role: 1, registrationSubmittedAt: -1 });
+
+    // ---------- migration: existing workers default to approved ----------
+    try {
+      const migrationResult = await usersCollection.updateMany(
+        { role: 'worker', workerAccountStatus: { $exists: false } },
+        { $set: { workerAccountStatus: 'approved' } }
+      );
+      if (migrationResult.modifiedCount > 0) {
+        console.log(`✅ Migration: set workerAccountStatus=approved for ${migrationResult.modifiedCount} existing workers`);
+      }
+    } catch (migrationErr) {
+      console.warn('⚠️ Worker migration failed (non-blocking):', migrationErr.message);
+    }
+
+
     function pruneEmpty(obj) {
       Object.keys(obj).forEach((k) => {
         const v = obj[k];
@@ -612,7 +633,17 @@ async function startServer() {
       const allowed = [
         'firstName', 'lastName', 'phone', 'headline', 'bio',
         'skills', 'isAvailable', 'profileCover', 'address1', 'address2',
-        'city', 'country', 'zip', 'workExperience', 'role', 'email'
+        'city', 'country', 'zip', 'workExperience', 'role', 'email',
+        // --- Registration v2 fields ---
+        'district', 'fullLegalName', 'nidNumber',
+        'nidFrontImageUrl', 'nidBackImageUrl',
+        'emergencyContactName', 'emergencyContactPhone',
+        'payoutWalletProvider', 'payoutWalletNumber',
+        'termsAcceptedAt', 'privacyAcceptedAt',
+        'termsVersion', 'privacyVersion',
+        'ageConfirmedAt', 'workerAccountStatus',
+        'servicesOffered', 'serviceArea', 'certifications', 'portfolio',
+        'experienceYears', 'locationGeo', 'emailVerified',
       ];
 
       const set = {};
@@ -634,9 +665,30 @@ async function startServer() {
         set.workExperience = Number.isFinite(n) ? n : 0;
       }
       if (typeof set.email === 'string') set.email = set.email.toLowerCase().trim();
+      if (typeof set.fullLegalName === 'string') set.fullLegalName = set.fullLegalName.trim();
+      if (typeof set.district === 'string') set.district = set.district.trim();
+      if (typeof set.nidNumber === 'string') set.nidNumber = set.nidNumber.trim();
+      if (typeof set.emergencyContactPhone === 'string') set.emergencyContactPhone = set.emergencyContactPhone.trim();
+      if (typeof set.payoutWalletNumber === 'string') set.payoutWalletNumber = set.payoutWalletNumber.trim();
+      // Only allow safe enum values for workerAccountStatus
+      if (set.workerAccountStatus && !['draft','pending_review','approved','rejected'].includes(set.workerAccountStatus)) {
+        delete set.workerAccountStatus;
+      }
 
       return pruneEmpty(set);
     }
+
+    // Validation helpers (Bangladesh-specific)
+    const BD_MOBILE_REGEX = /^01[3-9]\d{8}$/;
+    const NID_REGEX = /^\d{10}$|^\d{17}$/; // 10 or 17 digit NID
+
+    function isValidBdMobile(phone) {
+      return BD_MOBILE_REGEX.test(String(phone || '').trim());
+    }
+    function isValidNid(nid) {
+      return NID_REGEX.test(String(nid || '').trim());
+    }
+
 
     // helper: try to fetch worker identity from usersCollection or Firebase Admin
     async function getWorkerIdentity(workerId, { usersCollection }) {
@@ -894,6 +946,107 @@ async function startServer() {
       }
     });
 
+    // -------- Admin: Dashboard Stats --------
+    app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
+      try {
+        const [
+          totalProviders,
+          verifiedProviders,
+          suspendedProviders,
+          totalBookings,
+          pendingBookings,
+          totalCustomers,
+          activeServices,
+          openQueries
+        ] = await Promise.all([
+          usersCollection.countDocuments({ role: 'worker' }),
+          usersCollection.countDocuments({ role: 'worker', isVerified: true }),
+          usersCollection.countDocuments({ role: 'worker', isSuspended: true }),
+          applicationsCollection.countDocuments({}),
+          applicationsCollection.countDocuments({ status: 'pending' }),
+          usersCollection.countDocuments({ role: 'client' }),
+          servicesCollection.countDocuments({ isActive: true }),
+          userQueriesCollection.countDocuments({ status: 'open' })
+        ]);
+
+        res.json({
+          providers: {
+            total: totalProviders,
+            verified: verifiedProviders,
+            unverified: totalProviders - verifiedProviders,
+            suspended: suspendedProviders
+          },
+          bookings: {
+            total: totalBookings,
+            pending: pendingBookings
+          },
+          customers: {
+            total: totalCustomers
+          },
+          services: {
+            active: activeServices
+          },
+          support: {
+            openQueries: openQueries
+          }
+        });
+      } catch (err) {
+        console.error('GET /api/admin/stats failed:', err);
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    // -------- Admin: Revenue Analytics --------
+    app.get('/api/admin/revenue-stats', authenticateAdmin, async (req, res) => {
+      try {
+        const days = parseInt(req.query.days) || 30;
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - days);
+
+        const pipeline = [
+          {
+            $match: {
+              type: 'platform_fee_debit',
+              createdAt: { $gte: startDate }
+            }
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m-%d", date: "$createdAt" }
+              },
+              revenue: { $sum: "$amount" },
+              count: { $sum: 1 }
+            }
+          },
+          { $sort: { "_id": 1 } }
+        ];
+
+        const stats = await ledgersCollection.aggregate(pipeline).toArray();
+        
+        // Fill in missing dates with zero revenue
+        const result = [];
+        const curr = new Date(startDate);
+        const end = new Date();
+        
+        while (curr <= end) {
+          const dateStr = curr.toISOString().split('T')[0];
+          const entry = stats.find(s => s._id === dateStr);
+          result.push({
+            date: dateStr,
+            revenue: entry ? entry.revenue : 0,
+            count: entry ? entry.count : 0
+          });
+          curr.setDate(curr.getDate() + 1);
+        }
+
+        res.json(result);
+      } catch (err) {
+        console.error('GET /api/admin/revenue-stats failed:', err);
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
     // -------- Admin: Providers (workers) --------
     app.get('/api/admin/providers', authenticateAdmin, async (req, res) => {
       try {
@@ -904,6 +1057,18 @@ async function startServer() {
         const q = { role: 'worker' };
         if (status === 'active') q.isSuspended = { $ne: true };
         if (status === 'suspended') q.isSuspended = true;
+
+        const search = req.query.search;
+        if (search) {
+          const regex = new RegExp(search, 'i');
+          q.$or = [
+            { firstName: regex },
+            { lastName: regex },
+            { displayName: regex },
+            { email: regex }
+          ];
+        }
+
         const [list, total] = await Promise.all([
           usersCollection.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
           usersCollection.countDocuments(q),
@@ -947,6 +1112,81 @@ async function startServer() {
       }
     });
 
+    app.patch('/api/admin/providers/:uid/verify', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const { isVerified } = req.body || {};
+        const v = !!isVerified;
+        const result = await usersCollection.updateOne(
+          { uid, role: 'worker' },
+          { $set: { isVerified: v, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Provider not found' });
+        await logAdminAction(req, 'provider_verify', 'providers', { providerUid: uid, isVerified: v });
+        res.json({ ok: true, isVerified: v });
+      } catch (err) {
+        console.error('PATCH /api/admin/providers/:uid/verify failed:', err);
+        res.status(500).json({ error: 'Verification update failed' });
+      }
+    });
+
+    app.post('/api/admin/providers/:uid/due', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const { action, amount, reason } = req.body || {}; // action: 'add' | 'subtract' | 'clear'
+        
+        let user = await usersCollection.findOne({ uid });
+        if (!user) { // fallback to checking _id if uid is actually an _id string
+           if (ObjectId.isValid(uid)) {
+               user = await usersCollection.findOne({ _id: new ObjectId(uid) });
+           }
+        }
+        if (!user || user.role !== 'worker') return res.status(404).json({ error: 'Worker not found' });
+        
+        let currentDue = Number(user.dueBalance) || 0;
+        let newDue = currentDue;
+        let numAmount = Math.abs(Number(amount) || 0);
+
+        if (action === 'add') {
+            newDue += numAmount;
+        } else if (action === 'subtract') {
+            newDue -= numAmount;
+            if (newDue < 0) newDue = 0;
+        } else if (action === 'clear') {
+            numAmount = currentDue; // record the cleared amount
+            newDue = 0;
+        } else {
+            return res.status(400).json({ error: 'Invalid action. Use add, subtract, or clear.' });
+        }
+
+        // Apply update
+        await usersCollection.updateOne(
+          { _id: user._id },
+          { $set: { dueBalance: newDue, updatedAt: new Date() } }
+        );
+
+        // BUG FIX #5: Store workerId as Firebase UID in ledger for consistency
+        const direction = action === 'add' ? 'DEBIT' : 'CREDIT'; // add = charges worker more, subtract/clear = credits them
+        if (numAmount > 0) {
+            await ledgersCollection.insertOne({
+                workerId: user.uid, // Firebase UID — consistent with all other ledger entries
+                type: 'ADMIN_MANUAL_ADJUSTMENT',
+                direction: direction,
+                amount: numAmount,
+                reason: reason || `Admin manually ${action === 'clear' ? 'cleared' : action + 'ed'} dues`,
+                adminEmail: req.adminUser?.email || 'admin',
+                createdAt: new Date()
+            });
+        }
+        
+        await logAdminAction(req, 'provider_due_update', 'providers', { providerId: user._id.toString(), action, amount: numAmount, newDue });
+        res.json({ ok: true, dueBalance: newDue });
+      } catch (err) {
+        console.error('POST /api/admin/providers/:uid/due failed:', err);
+        res.status(500).json({ error: 'Failed to update due balance' });
+      }
+    });
+
     // -------- Admin: Bookings (applications + browseJobs) --------
     app.get('/api/admin/bookings', authenticateAdmin, async (req, res) => {
       try {
@@ -961,30 +1201,60 @@ async function startServer() {
           applicationsCollection.countDocuments(q),
         ]);
         
-        // Enrich bookings with jobTitle + workerName + clientName for admin UI
         const workerIds = Array.from(new Set(list.map((x) => String(x.workerId || '')).filter(Boolean)));
         const clientIds = Array.from(new Set(list.map((x) => String(x.clientId || '')).filter(Boolean)));
         const jobIdStrings = Array.from(new Set(list.map((x) => String(x.jobId || '')).filter(Boolean)));
         const jobObjectIds = jobIdStrings.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id));
 
+        const WORKER_PROJECTION = {
+          uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1,
+          phone: 1, profileCover: 1, headline: 1, bio: 1,
+          isVerified: 1, isSuspended: 1, city: 1, country: 1,
+          role: 1, workerAccountStatus: 1,
+          servicesOffered: 1, experienceYears: 1, workExperience: 1,
+          createdAt: 1,
+        };
+        const CLIENT_PROJECTION = {
+          uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1,
+          phone: 1, profileCover: 1, city: 1, country: 1,
+          isVerified: 1, isSuspended: 1, role: 1, createdAt: 1,
+        };
+
         const [workers, clients, browseJobs, jobs] = await Promise.all([
           workerIds.length
             ? usersCollection
                 .find({ uid: { $in: workerIds } })
-                .project({ uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1 })
+                .project(WORKER_PROJECTION)
                 .toArray()
             : [],
           clientIds.length
             ? usersCollection
                 .find({ uid: { $in: clientIds } })
-                .project({ uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1 })
+                .project(CLIENT_PROJECTION)
                 .toArray()
             : [],
           jobObjectIds.length
-            ? browseJobsCollection.find({ _id: { $in: jobObjectIds } }).project({ title: 1 }).toArray()
+            ? browseJobsCollection.find({ _id: { $in: jobObjectIds } }).project({ 
+                title: 1, 
+                description: 1,
+                budget: 1, 
+                location: 1, 
+                floorHouseNo: 1, 
+                landmark: 1,
+                locationGeo: 1,
+                categoryId: 1,
+                serviceName: 1,
+                scheduledDate: 1,
+              }).toArray()
             : [],
           jobObjectIds.length
-            ? jobsCollection.find({ _id: { $in: jobObjectIds } }).project({ title: 1 }).toArray()
+            ? jobsCollection.find({ _id: { $in: jobObjectIds } }).project({ 
+                title: 1, 
+                totalPrice: 1, 
+                address: 1,
+                locationGeo: 1,
+                description: 1,
+              }).toArray()
             : [],
         ]);
 
@@ -994,21 +1264,63 @@ async function startServer() {
           return (u.displayName || full || u.email || u.uid || '').trim();
         };
 
-        const workerNameByUid = new Map(workers.map((u) => [String(u.uid), toName(u)]));
-        const clientNameByUid = new Map(clients.map((u) => [String(u.uid), toName(u)]));
-        const jobTitleById = new Map();
-        browseJobs.forEach((j) => jobTitleById.set(String(j._id), String(j.title || '').trim()));
-        jobs.forEach((j) => jobTitleById.set(String(j._id), String(j.title || '').trim()));
+        const workerByUid = new Map(workers.map((u) => [String(u.uid), u]));
+        const clientByUid = new Map(clients.map((u) => [String(u.uid), u]));
+        const jobDataById = new Map();
+        browseJobs.forEach((j) => jobDataById.set(String(j._id), j));
+        jobs.forEach((j) => jobDataById.set(String(j._id), j));
 
         const enriched = list.map((app) => {
           const workerId = String(app.workerId || '');
           const clientId = String(app.clientId || '');
           const jobId = String(app.jobId || '');
+          const workerDoc = workerByUid.get(workerId) || null;
+          const clientDoc = clientByUid.get(clientId) || null;
+          const jobDoc = jobDataById.get(jobId) || null;
           return {
             ...app,
-            workerName: workerNameByUid.get(workerId) || app.workerName || workerId || '',
-            clientName: clientNameByUid.get(clientId) || app.clientName || clientId || '',
-            jobTitle: jobTitleById.get(jobId) || app.jobTitle || app.jobName || '',
+            workerName: toName(workerDoc) || app.workerName || workerId || '',
+            clientName: toName(clientDoc) || app.clientName || clientId || '',
+            jobTitle: (jobDoc?.title) || app.jobTitle || app.jobName || '',
+            workerProfile: workerDoc ? {
+              uid: workerDoc.uid,
+              name: toName(workerDoc),
+              email: workerDoc.email || '',
+              phone: workerDoc.phone || '',
+              profileCover: workerDoc.profileCover || '',
+              headline: workerDoc.headline || '',
+              city: workerDoc.city || '',
+              country: workerDoc.country || '',
+              isVerified: !!workerDoc.isVerified,
+              isSuspended: !!workerDoc.isSuspended,
+              workerAccountStatus: workerDoc.workerAccountStatus || '',
+              servicesOffered: workerDoc.servicesOffered || null,
+              experienceYears: workerDoc.experienceYears || workerDoc.workExperience || 0,
+              createdAt: workerDoc.createdAt || null,
+            } : null,
+            clientProfile: clientDoc ? {
+              uid: clientDoc.uid,
+              name: toName(clientDoc),
+              email: clientDoc.email || '',
+              phone: clientDoc.phone || '',
+              profileCover: clientDoc.profileCover || '',
+              city: clientDoc.city || '',
+              country: clientDoc.country || '',
+              isVerified: !!clientDoc.isVerified,
+              isSuspended: !!clientDoc.isSuspended,
+              createdAt: clientDoc.createdAt || null,
+            } : null,
+            jobDetails: jobDoc ? {
+              title: jobDoc.title || '',
+              description: jobDoc.description || '',
+              budget: jobDoc.budget || jobDoc.totalPrice || null,
+              location: jobDoc.location || jobDoc.address || '',
+              floorHouseNo: jobDoc.floorHouseNo || '',
+              landmark: jobDoc.landmark || '',
+              locationGeo: jobDoc.locationGeo || null,
+              serviceName: jobDoc.serviceName || '',
+              scheduledDate: jobDoc.scheduledDate || null,
+            } : null,
           };
         });
 
@@ -1016,6 +1328,104 @@ async function startServer() {
       } catch (err) {
         console.error('GET /api/admin/bookings failed:', err);
         res.status(500).json({ error: 'Failed to fetch bookings' });
+      }
+    });
+
+    // -------- Admin: Single Booking Detail --------
+    app.get('/api/admin/bookings/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid booking id' });
+        const booking = await applicationsCollection.findOne({ _id: new ObjectId(id) });
+        if (!booking) return res.status(404).json({ error: 'Booking not found' });
+
+        const workerId = String(booking.workerId || '');
+        const clientId = String(booking.clientId || '');
+        const jobId = String(booking.jobId || '');
+        const jobObjectId = ObjectId.isValid(jobId) ? new ObjectId(jobId) : null;
+
+        const WORKER_PROJECTION = {
+          uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1,
+          phone: 1, profileCover: 1, headline: 1, bio: 1,
+          isVerified: 1, isSuspended: 1, city: 1, country: 1,
+          role: 1, workerAccountStatus: 1,
+          servicesOffered: 1, experienceYears: 1, workExperience: 1,
+          certifications: 1, skills: 1, createdAt: 1,
+        };
+        const CLIENT_PROJECTION = {
+          uid: 1, displayName: 1, firstName: 1, lastName: 1, email: 1,
+          phone: 1, profileCover: 1, city: 1, country: 1,
+          isVerified: 1, isSuspended: 1, role: 1, createdAt: 1, bio: 1,
+        };
+
+        const [workerDoc, clientDoc, browseJob, legacyJob] = await Promise.all([
+          workerId ? usersCollection.findOne({ uid: workerId }, { projection: WORKER_PROJECTION }) : null,
+          clientId ? usersCollection.findOne({ uid: clientId }, { projection: CLIENT_PROJECTION }) : null,
+          jobObjectId ? browseJobsCollection.findOne({ _id: jobObjectId }) : null,
+          jobObjectId ? jobsCollection.findOne({ _id: jobObjectId }) : null,
+        ]);
+
+        const jobDoc = browseJob || legacyJob;
+
+        const toName = (u) => {
+          if (!u) return null;
+          const full = [u.firstName, u.lastName].filter(Boolean).join(' ').trim();
+          return (u.displayName || full || u.email || u.uid || '').trim();
+        };
+
+        res.json({
+          ...booking,
+          workerName: toName(workerDoc) || booking.workerName || workerId || '',
+          clientName: toName(clientDoc) || booking.clientName || clientId || '',
+          jobTitle: jobDoc?.title || booking.jobTitle || booking.jobName || '',
+          workerProfile: workerDoc ? {
+            uid: workerDoc.uid,
+            name: toName(workerDoc),
+            email: workerDoc.email || '',
+            phone: workerDoc.phone || '',
+            profileCover: workerDoc.profileCover || '',
+            headline: workerDoc.headline || '',
+            bio: workerDoc.bio || '',
+            city: workerDoc.city || '',
+            country: workerDoc.country || '',
+            isVerified: !!workerDoc.isVerified,
+            isSuspended: !!workerDoc.isSuspended,
+            workerAccountStatus: workerDoc.workerAccountStatus || '',
+            servicesOffered: workerDoc.servicesOffered || null,
+            experienceYears: workerDoc.experienceYears || workerDoc.workExperience || 0,
+            certifications: workerDoc.certifications || [],
+            skills: workerDoc.skills || [],
+            createdAt: workerDoc.createdAt || null,
+          } : null,
+          clientProfile: clientDoc ? {
+            uid: clientDoc.uid,
+            name: toName(clientDoc),
+            email: clientDoc.email || '',
+            phone: clientDoc.phone || '',
+            profileCover: clientDoc.profileCover || '',
+            bio: clientDoc.bio || '',
+            city: clientDoc.city || '',
+            country: clientDoc.country || '',
+            isVerified: !!clientDoc.isVerified,
+            isSuspended: !!clientDoc.isSuspended,
+            createdAt: clientDoc.createdAt || null,
+          } : null,
+          jobDetails: jobDoc ? {
+            title: jobDoc.title || '',
+            description: jobDoc.description || '',
+            budget: jobDoc.budget || jobDoc.totalPrice || null,
+            location: jobDoc.location || jobDoc.address || '',
+            floorHouseNo: jobDoc.floorHouseNo || '',
+            landmark: jobDoc.landmark || '',
+            locationGeo: jobDoc.locationGeo || null,
+            serviceName: jobDoc.serviceName || '',
+            scheduledDate: jobDoc.scheduledDate || null,
+            categoryId: jobDoc.categoryId || null,
+          } : null,
+        });
+      } catch (err) {
+        console.error('GET /api/admin/bookings/:id failed:', err);
+        res.status(500).json({ error: 'Failed to fetch booking detail' });
       }
     });
 
@@ -1041,15 +1451,74 @@ async function startServer() {
       }
     });
 
+    // -------- Admin: Dashboard Stats --------
+    app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
+      try {
+        const [providersTotal, providersUnverified, bookingsTotal, activeServices] = await Promise.all([
+          usersCollection.countDocuments({ role: 'worker' }),
+          usersCollection.countDocuments({ role: 'worker', isVerified: false }),
+          applicationsCollection.countDocuments({}),
+          servicesCollection.countDocuments({ isActive: true })
+        ]);
+        
+        res.json({
+          providers: { total: providersTotal, unverified: providersUnverified },
+          bookings: { total: bookingsTotal },
+          services: { active: activeServices }
+        });
+      } catch (err) {
+        console.error('GET /api/admin/stats failed:', err);
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    // -------- Admin: Ledgers --------
+    app.get('/api/admin/ledgers', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          ledgersCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          ledgersCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/ledgers failed:', err);
+        res.status(500).json({ error: 'Failed to fetch ledgers' });
+      }
+    });
+
+    // -------- Admin: Due Payments (Manual Verifications) --------
+    app.get('/api/admin/due-payments', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const query = { isDuePayment: true, status: 'PENDING_VERIFICATION' };
+        
+        const [list, total] = await Promise.all([
+          paymentRequestsCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          paymentRequestsCollection.countDocuments(query),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/due-payments failed:', err);
+        res.status(500).json({ error: 'Failed to fetch due payments' });
+      }
+    });
+
     // -------- Admin: Payment requests (providers) --------
     app.get('/api/admin/payment-requests', authenticateAdmin, async (req, res) => {
       try {
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
         const skip = (page - 1) * limit;
+        // Don't mix due payments in standard provider payment requests table
+        const query = { isDuePayment: { $ne: true } };
         const [list, total] = await Promise.all([
-          paymentRequestsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-          paymentRequestsCollection.countDocuments({}),
+          paymentRequestsCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          paymentRequestsCollection.countDocuments(query),
         ]);
         res.json({ list, total, page, limit });
       } catch (err) {
@@ -1129,6 +1598,62 @@ async function startServer() {
       } catch (err) {
         console.error('POST /api/admin/settlements failed:', err);
         res.status(500).json({ error: 'Create failed' });
+      }
+    });
+
+    app.patch('/api/admin/settlements/:id', authenticateAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { status } = req.body || {};
+        const statusIn = String(status || '').toLowerCase();
+        if (!['pending', 'completed', 'failed'].includes(statusIn)) return res.status(400).json({ error: 'Invalid status' });
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const result = await settlementsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: statusIn, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Not found' });
+        await logAdminAction(req, 'settlement_status', 'settlements', { settlementId: id, status: statusIn });
+        res.json({ ok: true, status: statusIn });
+      } catch (err) {
+        console.error('PATCH /api/admin/settlements/:id failed:', err);
+        res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: All Transactions --------
+    app.get('/api/admin/transactions', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const [list, total] = await Promise.all([
+          transactionsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          transactionsCollection.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/transactions failed:', err);
+        res.status(500).json({ error: 'Failed to fetch transactions' });
+      }
+    });
+
+    // -------- Admin: Worker Job Requests --------
+    app.get('/api/admin/worker-job-requests', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const statusIn = req.query.status;
+        const q = statusIn ? { status: statusIn } : {};
+        const [list, total] = await Promise.all([
+          workerJobRequestsCollection.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          workerJobRequestsCollection.countDocuments(q),
+        ]);
+        res.json({ list, total, page, limit });
+      } catch (err) {
+        console.error('GET /api/admin/worker-job-requests failed:', err);
+        res.status(500).json({ error: 'Failed' });
       }
     });
 
@@ -1412,10 +1937,10 @@ async function startServer() {
           userQueriesCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
           userQueriesCollection.countDocuments({}),
         ]);
-        res.json({ list, total, page, limit });
+        res.json({ ok: true, list, total });
       } catch (err) {
         console.error('GET /api/admin/support/queries failed:', err);
-        res.status(500).json({ error: 'Failed to fetch queries' });
+        res.status(500).json({ error: 'Fetch failed' });
       }
     });
 
@@ -1435,6 +1960,28 @@ async function startServer() {
       } catch (err) {
         console.error('PATCH /api/admin/support/queries/:id failed:', err);
         res.status(500).json({ error: 'Update failed' });
+      }
+    });
+
+    // -------- Admin: Audit Logs --------
+    app.get('/api/admin/audit-logs', authenticateAdmin, async (req, res) => {
+      try {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const { adminUid, action } = req.query;
+        const q = {};
+        if (adminUid) q.adminUid = adminUid;
+        if (action) q.action = action;
+
+        const [list, total] = await Promise.all([
+          adminAuditLogCollection.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          adminAuditLogCollection.countDocuments(q),
+        ]);
+        res.json({ ok: true, list, total });
+      } catch (err) {
+        console.error('GET /api/admin/audit-logs failed:', err);
+        res.status(500).json({ error: 'Fetch failed' });
       }
     });
 
@@ -1770,29 +2317,124 @@ async function startServer() {
       }
     });
 
-    // -------- Admin: Notifications (broadcast queue) --------
+    // -------- Admin: Notifications (broadcast) --------
+    // GET: list of broadcast notification records (admin-created broadcasts stored separately)
     app.get('/api/admin/promo/notifications', authenticateAdmin, async (req, res) => {
       try {
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
         const skip = (page - 1) * limit;
+        const col = db.collection('broadcastNotifications');
         const [list, total] = await Promise.all([
-          notificationsCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-          notificationsCollection.countDocuments({}),
+          col.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          col.countDocuments({}),
         ]);
         res.json({ list, total, page, limit });
       } catch (err) {
         console.error('GET /api/admin/promo/notifications failed:', err);
-        res.status(500).json({ error: 'Failed to fetch notifications' });
+        res.status(500).json({ error: 'Failed to fetch broadcast history' });
       }
     });
 
-    // -------- Admin: Email (campaign metadata) - stub --------
+    // POST: broadcast an in-app notification to all/clients/workers
+    app.post('/api/admin/promo/notifications/broadcast', authenticateAdmin, async (req, res) => {
+      try {
+        const { title, message, type = 'info', targetAudience = 'all' } = req.body || {};
+        if (!title || !message) return res.status(400).json({ error: 'title and message are required' });
+        if (!['all', 'clients', 'workers'].includes(targetAudience)) return res.status(400).json({ error: 'Invalid targetAudience' });
+        if (!['info', 'success', 'warning', 'error'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
+
+        // Build user query
+        let userQuery = {};
+        if (targetAudience === 'clients') userQuery = { role: 'client' };
+        else if (targetAudience === 'workers') userQuery = { role: 'worker' };
+
+        const users = await usersCollection.find(userQuery, { projection: { uid: 1 } }).toArray();
+        let sentCount = 0;
+        for (const user of users) {
+          if (user.uid) {
+            await createNotification(user.uid, title, message, type, null, null);
+            sentCount++;
+          }
+        }
+
+        // Store broadcast record
+        const record = {
+          title, message, type, targetAudience,
+          sentCount,
+          sentBy: req.user.uid,
+          createdAt: new Date(),
+        };
+        await db.collection('broadcastNotifications').insertOne(record);
+        await logAdminAction(req, 'broadcast_notification', 'notifications', { title, targetAudience, sentCount });
+
+        res.json({ ok: true, sentCount });
+      } catch (err) {
+        console.error('POST /api/admin/promo/notifications/broadcast failed:', err);
+        res.status(500).json({ error: 'Broadcast failed' });
+      }
+    });
+
+    // -------- Admin: Email campaigns --------
+    // GET: list of email campaigns
     app.get('/api/admin/promo/email', authenticateAdmin, async (req, res) => {
       try {
-        res.json({ list: [], message: 'Email campaign triggers - integrate with your email provider' });
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const col = db.collection('emailCampaigns');
+        const [list, total] = await Promise.all([
+          col.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+          col.countDocuments({}),
+        ]);
+        res.json({ list, total, page, limit });
       } catch (err) {
+        console.error('GET /api/admin/promo/email failed:', err);
         res.status(500).json({ error: 'Failed to fetch email campaigns' });
+      }
+    });
+
+    // POST: send a bulk email campaign
+    app.post('/api/admin/promo/email/send', authenticateAdmin, async (req, res) => {
+      try {
+        const { subject, htmlBody, targetAudience = 'all' } = req.body || {};
+        if (!subject || !htmlBody) return res.status(400).json({ error: 'subject and htmlBody are required' });
+        if (!['all', 'clients', 'workers'].includes(targetAudience)) return res.status(400).json({ error: 'Invalid targetAudience' });
+
+        const { sendEmail } = require('./utils/emailService');
+
+        // Build user query
+        let userQuery = {};
+        if (targetAudience === 'clients') userQuery = { role: 'client' };
+        else if (targetAudience === 'workers') userQuery = { role: 'worker' };
+
+        const users = await usersCollection.find(userQuery, { projection: { uid: 1, email: 1, firstName: 1, lastName: 1 } }).toArray();
+        let sentCount = 0;
+        let failCount = 0;
+        for (const user of users) {
+          if (user.email) {
+            const result = await sendEmail(user.email, subject, htmlBody);
+            if (result.success) sentCount++;
+            else failCount++;
+          }
+        }
+
+        // Store campaign record
+        const record = {
+          subject, targetAudience,
+          sentCount, failCount,
+          totalTargeted: users.length,
+          sentBy: req.user.uid,
+          status: failCount === 0 ? 'success' : (sentCount === 0 ? 'failed' : 'partial'),
+          createdAt: new Date(),
+        };
+        await db.collection('emailCampaigns').insertOne(record);
+        await logAdminAction(req, 'send_email_campaign', 'emailCampaigns', { subject, targetAudience, sentCount, failCount });
+
+        res.json({ ok: true, sentCount, failCount, totalTargeted: users.length });
+      } catch (err) {
+        console.error('POST /api/admin/promo/email/send failed:', err);
+        res.status(500).json({ error: 'Email send failed' });
       }
     });
 
@@ -2224,9 +2866,8 @@ async function startServer() {
           uid: doc.uid,
           role: doc.role || 'user',
           displayName:
-            doc.displayName ||
-            [doc.firstName, doc.lastName].filter(Boolean).join(' ').trim() ||
-            'User',
+            ([doc.firstName, doc.lastName].filter(Boolean).join(' ').trim()) ||
+            (doc.displayName && doc.displayName !== 'User' ? doc.displayName : 'User'),
           firstName: doc.firstName || '',
           lastName: doc.lastName || '',
           headline: doc.headline || '',
@@ -2245,8 +2886,8 @@ async function startServer() {
           createdAt: doc.createdAt || null,
           updatedAt: doc.updatedAt || null,
           lastActiveAt: doc.lastActiveAt || null,
-          // Worker-specific public fields
-          ...(doc.role === 'worker' ? {
+          // Worker-specific public fields (include if role is worker OR if they have a registration status)
+          ...((doc.role === 'worker' || doc.workerAccountStatus) ? {
             servicesOffered: doc.servicesOffered || null,
             serviceArea: doc.serviceArea || null,
             experienceYears: doc.experienceYears || doc.workExperience || null,
@@ -2254,6 +2895,7 @@ async function startServer() {
             pricing: doc.pricing || null,
             portfolio: Array.isArray(doc.portfolio) ? doc.portfolio : [],
             certifications: Array.isArray(doc.certifications) ? doc.certifications : [],
+            workerAccountStatus: doc.workerAccountStatus || null,
           } : {}),
           // Client-specific public fields
           ...(doc.role === 'client' ? {
@@ -2622,6 +3264,7 @@ async function startServer() {
               uid: String(uid),
               createdAt: new Date(),
               role: validRole,
+              ...(validRole === 'worker' ? { dueBalance: 0, isApplyBlocked: false } : {}),
               ...(email ? { email: String(email).toLowerCase().trim() } : {})
             }
           },
@@ -2775,6 +3418,294 @@ async function startServer() {
       }
     });
 
+    // ===== NID DOCUMENT UPLOADS =====
+    const nidUploadMiddleware = multer({
+      storage,
+      limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+      fileFilter: (_req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+        if (allowed.includes(file.mimetype)) {
+          cb(null, true);
+        } else {
+          cb(new Error('Only JPEG, PNG, or WebP images are allowed for NID documents'));
+        }
+      },
+    }).single('file');
+
+    async function handleNidUpload(side, req, res) {
+      nidUploadMiddleware(req, res, async (err) => {
+        if (err) return res.status(400).json({ error: err.message });
+        try {
+          if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+          const uid = String(req.params.uid);
+          // Only allow user to upload their own NID
+          if (req.user && req.user.uid !== uid) {
+            return res.status(403).json({ error: 'Unauthorized' });
+          }
+          const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+          const fieldMap = {
+            'front': 'nidFrontImageUrl',
+            'back': 'nidBackImageUrl',
+            'emergencyFront': 'emergencyContactNidFrontUrl',
+            'emergencyBack': 'emergencyContactNidBackUrl'
+          };
+          const field = fieldMap[side] || 'emergencyContactNidImageUrl';
+          await usersCollection.updateOne(
+            { uid },
+            { $set: { [field]: publicUrl, updatedAt: new Date() }, $setOnInsert: { uid, createdAt: new Date() } },
+            { upsert: true }
+          );
+          res.json({ url: publicUrl, side });
+        } catch (e) {
+          console.error(`POST /api/users/:uid/nid/${side} failed:`, e);
+          res.status(500).json({ error: 'NID upload failed' });
+        }
+      });
+    }
+
+    app.post('/api/users/:uid/nid/front', (req, res) => handleNidUpload('front', req, res));
+    app.post('/api/users/:uid/nid/back',  (req, res) => handleNidUpload('back',  req, res));
+    app.post('/api/users/:uid/nid/emergencyFront', (req, res) => handleNidUpload('emergencyFront', req, res));
+    app.post('/api/users/:uid/nid/emergencyBack', (req, res) => handleNidUpload('emergencyBack', req, res));
+
+    // ===== REQUIRE APPROVED WORKER MIDDLEWARE =====
+    async function requireApprovedWorker(req, res, next) {
+      try {
+        const workerId = req.body?.workerId || req.params?.uid;
+        if (!workerId) return next();
+        const userDoc = await usersCollection.findOne({ uid: String(workerId) });
+        if (userDoc && userDoc.role === 'worker' && userDoc.workerAccountStatus !== 'approved') {
+          return res.status(403).json({
+            code: 'WORKER_NOT_APPROVED',
+            status: userDoc.workerAccountStatus || 'draft',
+            error: 'Your account is pending review. You cannot perform this action until approved by admin.'
+          });
+        }
+        next();
+      } catch (e) {
+        console.warn('requireApprovedWorker check failed (non-blocking):', e.message);
+        next();
+      }
+    }
+
+    // ===== WORKER REGISTRATION SUBMIT =====
+    app.post('/api/workers/registration/submit', async (req, res) => {
+      try {
+        const uid = req.user?.uid || req.body?.uid;
+        if (!uid) return res.status(401).json({ error: 'Authentication required' });
+
+        const b = req.body || {};
+        const s = (v) => String(v || '').trim();
+
+        // Check idempotency
+        const existing = await usersCollection.findOne({ uid });
+        if (existing?.workerAccountStatus === 'pending_review') {
+          return res.status(409).json({ code: 'ALREADY_SUBMITTED', error: 'Registration already submitted and under review.' });
+        }
+        if (existing?.workerAccountStatus === 'approved') {
+          return res.status(409).json({ code: 'ALREADY_APPROVED', error: 'Your account is already approved.' });
+        }
+
+        // Required field validation
+        const missing = [];
+        if (!s(b.fullLegalName)) missing.push('fullLegalName');
+        if (!s(b.phone)) missing.push('phone');
+        if (!s(b.city)) missing.push('city');
+        if (!s(b.district)) missing.push('district');
+        if (!s(b.nidNumber)) missing.push('nidNumber');
+        if (!s(b.emergencyContactName)) missing.push('emergencyContactName');
+        if (!s(b.emergencyContactPhone)) missing.push('emergencyContactPhone');
+        if (!s(b.emergencyContactNidNumber)) missing.push('emergencyContactNidNumber');
+        if (!s(b.payoutWalletProvider)) missing.push('payoutWalletProvider');
+        if (!s(b.payoutWalletNumber)) missing.push('payoutWalletNumber');
+        if (!b.termsAcceptedAt) missing.push('termsAcceptedAt');
+        if (!b.privacyAcceptedAt) missing.push('privacyAcceptedAt');
+        if (!b.ageConfirmedAt) missing.push('ageConfirmedAt');
+        if (!s(b.termsVersion)) missing.push('termsVersion');
+        if (!s(b.privacyVersion)) missing.push('privacyVersion');
+
+        // Check NID images already uploaded
+        const userDoc = existing || {};
+        if (!userDoc.nidFrontImageUrl && !s(b.nidFrontImageUrl)) missing.push('nidFrontImageUrl (upload NID front first)');
+        if (!userDoc.nidBackImageUrl && !s(b.nidBackImageUrl)) missing.push('nidBackImageUrl (upload NID back first)');
+        if (!userDoc.profileCover && !s(b.profileCover)) missing.push('profileCover (upload profile photo first)');
+        if (!userDoc.emergencyContactNidFrontUrl && !s(b.emergencyContactNidFrontUrl)) missing.push('emergencyContactNidFrontUrl (upload Emergency NID front first)');
+        if (!userDoc.emergencyContactNidBackUrl && !s(b.emergencyContactNidBackUrl)) missing.push('emergencyContactNidBackUrl (upload Emergency NID back first)');
+
+        if (missing.length > 0) {
+          return res.status(400).json({ error: 'Missing required fields', missing });
+        }
+
+        // Format validation
+        if (!isValidBdMobile(b.phone)) {
+          return res.status(400).json({ error: 'Invalid phone number. Must be a valid Bangladesh mobile number (e.g. 01XXXXXXXXX).' });
+        }
+        if (!isValidBdMobile(b.emergencyContactPhone)) {
+          return res.status(400).json({ error: 'Invalid emergency contact phone number.' });
+        }
+        if (!isValidBdMobile(b.payoutWalletNumber)) {
+          return res.status(400).json({ error: 'Invalid payout wallet number. Must be a valid Bangladesh mobile number.' });
+        }
+        if (!isValidNid(b.nidNumber)) {
+          return res.status(400).json({ error: 'Invalid NID number. Must be 10 or 17 digits.' });
+        }
+        const validWalletProviders = ['bkash', 'nagad', 'rocket'];
+        if (!validWalletProviders.includes(s(b.payoutWalletProvider).toLowerCase())) {
+          return res.status(400).json({ error: 'Invalid payout wallet provider. Must be bkash, nagad, or rocket.' });
+        }
+
+        const now = new Date();
+        const updatePayload = {
+          fullLegalName: s(b.fullLegalName),
+          phone: s(b.phone),
+          city: s(b.city),
+          district: s(b.district),
+          nidNumber: s(b.nidNumber),
+          emergencyContactName: s(b.emergencyContactName),
+          emergencyContactPhone: s(b.emergencyContactPhone),
+          emergencyContactNidNumber: s(b.emergencyContactNidNumber),
+          emergencyContactNidFrontUrl: s(b.emergencyContactNidFrontUrl),
+          emergencyContactNidBackUrl: s(b.emergencyContactNidBackUrl),
+          payoutWalletProvider: s(b.payoutWalletProvider).toLowerCase(),
+          payoutWalletNumber: s(b.payoutWalletNumber),
+          termsAcceptedAt: new Date(b.termsAcceptedAt),
+          privacyAcceptedAt: new Date(b.privacyAcceptedAt),
+          ageConfirmedAt: new Date(b.ageConfirmedAt),
+          termsVersion: s(b.termsVersion),
+          privacyVersion: s(b.privacyVersion),
+          workerAccountStatus: 'pending_review',
+          registrationSubmittedAt: now,
+          updatedAt: now,
+        };
+
+        // Optionally update profile fields if provided
+        if (s(b.bio)) updatePayload.bio = s(b.bio);
+        if (b.experienceYears != null) updatePayload.experienceYears = Number(b.experienceYears) || 0;
+        if (s(b.firstName)) updatePayload.firstName = s(b.firstName);
+        if (s(b.lastName)) updatePayload.lastName = s(b.lastName);
+        if (s(b.country)) updatePayload.country = s(b.country);
+        if (b.servicesOffered) updatePayload.servicesOffered = b.servicesOffered;
+
+        updatePayload.role = 'worker';
+
+        await usersCollection.updateOne(
+          { uid },
+          { $set: updatePayload, $setOnInsert: { uid, createdAt: now } },
+          { upsert: true }
+        );
+
+        // Create in-app notification for admin (via notification to a default admin channel - optional)
+        console.log(`📋 Worker registration submitted: uid=${uid}, name=${updatePayload.fullLegalName}`);
+
+        res.json({ success: true, workerAccountStatus: 'pending_review' });
+      } catch (e) {
+        console.error('POST /api/workers/registration/submit failed:', e);
+        res.status(500).json({ error: 'Registration submission failed' });
+      }
+    });
+
+    // ===== ADMIN: WORKER REGISTRATION REVIEW =====
+    // List pending (or filtered) worker registrations
+    app.get('/api/admin/workers/registrations', authenticateAdmin, async (req, res) => {
+      try {
+        const { status = 'pending_review', page = 1, limit = 20, search = '' } = req.query;
+        const pageNum = Math.max(1, parseInt(page));
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
+        const skip = (pageNum - 1) * limitNum;
+
+        const filter = { role: 'worker' };
+        if (status && status !== 'all') filter.workerAccountStatus = status;
+        if (search) {
+          const r = new RegExp(search.trim(), 'i');
+          filter.$or = [{ firstName: r }, { lastName: r }, { fullLegalName: r }, { email: r }, { phone: r }];
+        }
+
+        const projection = {
+          uid: 1, firstName: 1, lastName: 1, fullLegalName: 1, email: 1, phone: 1,
+          city: 1, district: 1, profileCover: 1, servicesOffered: 1,
+          workerAccountStatus: 1, registrationSubmittedAt: 1, registrationReviewedAt: 1,
+          registrationRejectionReason: 1, createdAt: 1,
+        };
+
+        const [list, total] = await Promise.all([
+          usersCollection.find(filter).project(projection).sort({ registrationSubmittedAt: -1 }).skip(skip).limit(limitNum).toArray(),
+          usersCollection.countDocuments(filter),
+        ]);
+
+        res.json({ list, total, page: pageNum, limit: limitNum });
+      } catch (e) {
+        console.error('GET /api/admin/workers/registrations failed:', e);
+        res.status(500).json({ error: 'Failed to fetch registrations' });
+      }
+    });
+
+    // Get single worker registration detail (admin)
+    app.get('/api/admin/workers/:uid/registration', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const userDoc = await usersCollection.findOne({ uid });
+        if (!userDoc) return res.status(404).json({ error: 'Worker not found' });
+        // Return full profile (admin can see all fields)
+        res.json(userDoc);
+      } catch (e) {
+        console.error('GET /api/admin/workers/:uid/registration failed:', e);
+        res.status(500).json({ error: 'Failed to fetch worker registration' });
+      }
+    });
+
+    // Approve or reject a worker registration
+    app.patch('/api/admin/workers/:uid/registration', authenticateAdmin, async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const { action, rejectionReason = '' } = req.body || {};
+
+        if (!['approve', 'reject'].includes(action)) {
+          return res.status(400).json({ error: 'action must be "approve" or "reject"' });
+        }
+
+        const userDoc = await usersCollection.findOne({ uid });
+        if (!userDoc) return res.status(404).json({ error: 'Worker not found' });
+
+        const now = new Date();
+        let updateSet = { registrationReviewedAt: now, updatedAt: now };
+
+        if (action === 'approve') {
+          updateSet.workerAccountStatus = 'approved';
+          updateSet.isVerified = true;
+        } else {
+          updateSet.workerAccountStatus = 'rejected';
+          updateSet.registrationRejectionReason = String(rejectionReason).trim();
+        }
+
+        await usersCollection.updateOne({ uid }, { $set: updateSet });
+        await logAdminAction(req, `registration_${action}d`, 'worker', { uid, rejectionReason: rejectionReason || undefined });
+
+        // Send email notification (non-blocking)
+        const workerEmail = userDoc.email;
+        const workerName = [userDoc.firstName, userDoc.lastName].filter(Boolean).join(' ') || userDoc.fullLegalName || 'Worker';
+        try {
+          if (action === 'approve') {
+            const { sendWorkerRegistrationApprovedEmail } = require('./utils/emailService');
+            sendWorkerRegistrationApprovedEmail(workerEmail, workerName).catch(emailErr =>
+              console.warn('Approval email failed:', emailErr.message)
+            );
+          } else {
+            const { sendWorkerRegistrationRejectedEmail } = require('./utils/emailService');
+            sendWorkerRegistrationRejectedEmail(workerEmail, workerName, rejectionReason).catch(emailErr =>
+              console.warn('Rejection email failed:', emailErr.message)
+            );
+          }
+        } catch (emailErr) {
+          console.warn('Email send error (non-blocking):', emailErr.message);
+        }
+
+        res.json({ success: true, uid, workerAccountStatus: updateSet.workerAccountStatus });
+      } catch (e) {
+        console.error('PATCH /api/admin/workers/:uid/registration failed:', e);
+        res.status(500).json({ error: 'Failed to update registration status' });
+      }
+    });
+
     // ===== JOBS =====
     app.get('/api/jobs', async (_req, res) => {
       try {
@@ -2826,7 +3757,7 @@ async function startServer() {
     // ===== APPLICATIONS =====
 
     // Create/update a proposal (one per worker per job)
-    app.post('/api/applications', async (req, res) => {
+    app.post('/api/applications', requireApprovedWorker, async (req, res) => {
       try {
         const b = req.body || {};
 
@@ -2947,6 +3878,20 @@ async function startServer() {
           const status = s(b.negotiationStatus);
           if (['none', 'pending', 'countered', 'accepted', 'cancelled'].includes(status)) {
             setIf('negotiationStatus', status);
+          }
+        }
+
+        // Worker accepted client's counter but body had invalid/missing finalPrice (e.g. NaN -> null in JSON):
+        // negotiation becomes "accepted" without finalPrice; later "Accept Price" may write proposedPrice instead.
+        if (!isNew && existing) {
+          const nextNegotiation = $set.negotiationStatus ?? existing.negotiationStatus;
+          const prevNegotiation = String(existing.negotiationStatus || '').toLowerCase();
+          const finalInSet = $set.finalPrice;
+          const finalValid = finalInSet != null && Number(finalInSet) > 0;
+          const nextAccepted = String(nextNegotiation || '').toLowerCase() === 'accepted';
+          const counterNum = Number(existing.counterPrice);
+          if (nextAccepted && !finalValid && prevNegotiation === 'countered' && Number.isFinite(counterNum) && counterNum > 0) {
+            $set.finalPrice = counterNum;
           }
         }
 
@@ -3112,6 +4057,7 @@ async function startServer() {
                 category: job.category || null,
                 location: job.location || null,
                 deadline: job.deadline || null,
+                status: job.status || 'active',
               };
             }
           } catch {}
@@ -3474,6 +4420,9 @@ async function startServer() {
           updateFields.status = resolvedStatus;
           if (resolvedStatus === 'completed') {
             updateFields.completedAt = now;
+            if (oldStatus !== 'completed') {
+                updateFields.settlementStatus = 'PENDING';
+            }
           }
         } else {
           updateFields.status = statusIn;
@@ -3485,6 +4434,10 @@ async function startServer() {
         );
 
         if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
+
+        if (resolvedStatus === 'completed' && updateFields.settlementStatus === 'PENDING') {
+            await processJobSettlement(id);
+        }
 
         const doc = await applicationsCollection.findOne({ _id });
         res.json(doc);
@@ -3549,6 +4502,9 @@ async function startServer() {
           updateFields.status = resolvedStatus;
           if (resolvedStatus === 'completed') {
             updateFields.completedAt = now;
+            if (oldStatus !== 'completed') {
+                updateFields.settlementStatus = 'PENDING';
+            }
           }
         } else {
           updateFields.status = statusIn;
@@ -3562,6 +4518,10 @@ async function startServer() {
         );
 
         if (!upd.matchedCount) return res.status(404).json({ error: 'Application not found' });
+
+        if (resolvedStatus === 'completed' && updateFields.settlementStatus === 'PENDING') {
+            await processJobSettlement(id);
+        }
 
         const doc = await applicationsCollection.findOne({ _id });
         
@@ -4285,7 +5245,7 @@ async function startServer() {
             filter.status = statusLower;
           }
         } else {
-          filter.status = { $ne: 'completed' };
+          filter.status = { $nin: ['completed', 'expired'] };
         }
 
         // Skills filter (comma-separated, matches any) - Build this first
@@ -6628,6 +7588,393 @@ async function startServer() {
       });
     });
 
+    // ---------- Monetization & Fee Settlement Routes ----------
+
+    function calculatePlatformFee(laborAmount) {
+      if (!laborAmount || laborAmount <= 0) return { fee: 0, tier: 'A' };
+      let rate = 0.10;
+      let cap = 15;
+      let tier = 'A';
+      if (laborAmount > 300 && laborAmount <= 800) {
+        rate = 0.08;
+        cap = 50;
+        tier = 'B';
+      } else if (laborAmount > 800) {
+        rate = 0.07;
+        cap = 200;
+        tier = 'C';
+      }
+      let fee = Math.min(laborAmount * rate, cap);
+      return { fee: Math.max(0, Math.round(fee)), tier };
+    }
+
+    async function processJobSettlement(applicationId) {
+      try {
+        const app = await applicationsCollection.findOne({ _id: new ObjectId(applicationId) });
+        if (!app || app.settlementStatus !== 'PENDING') return;
+
+        const laborAmount = Number(app.finalPrice || app.proposedPrice) || 0;
+        const { fee: platformFee, tier } = calculatePlatformFee(laborAmount);
+
+        // Calculate approved extra costs (to include in sum if needed, but only fee applies to labor)
+        const approvedCharges = await additionalChargesCollection.find({
+            applicationId: new ObjectId(applicationId),
+            status: 'APPROVED'
+        }).toArray();
+        const approvedExtrasAmount = approvedCharges
+            .filter(c => c.type === 'EXTRA_COST')
+            .reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+
+        // Update Order with final calculated amounts
+        await applicationsCollection.updateOne(
+          { _id: new ObjectId(applicationId) },
+          { $set: {
+              laborAmount,
+              approvedExtrasAmount,
+              platformFee,
+              feeTier: tier,
+              settlementStatus: 'SETTLED'
+            }
+          }
+        );
+
+        // Record Fee to Ledger and Worker Due
+        if (platformFee > 0 && app.workerId) {
+            await ledgersCollection.insertOne({
+                transactionId: new ObjectId().toString(),
+                workerId: String(app.workerId),
+                orderId: new ObjectId(applicationId),
+                type: 'platform_fee_debit',
+                amount: platformFee,
+                direction: 'DEBIT',
+                createdAt: new Date()
+            });
+
+            await usersCollection.updateOne(
+                { uid: String(app.workerId) },
+                { $inc: { dueBalance: platformFee } }
+            );
+
+            // Fetch updated worker
+            const worker = await usersCollection.findOne({ uid: String(app.workerId) });
+            // If dueBalance > 200 and not already notified, optionally flag them or just let cron job handle it.
+            if (worker && worker.dueBalance >= 200 && !worker.dueWarningNotifiedAt) {
+                 await usersCollection.updateOne(
+                     { uid: String(app.workerId) },
+                     { $set: { dueWarningNotifiedAt: new Date() } }
+                 );
+            }
+        }
+      } catch (err) {
+        console.error('Error processing job settlement:', err);
+      }
+    }
+
+    app.post('/api/fees/calculate', (req, res) => {
+      try {
+        const laborAmount = Number(req.body.laborAmount) || 0;
+        const result = calculatePlatformFee(laborAmount);
+        res.json(result);
+      } catch (err) {
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    app.post('/api/applications/:id/additional-charges', upload.array('receipts', 5), async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { workerId, amount, type, description } = req.body;
+        const files = req.files || [];
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        
+        const receiptUrls = files.map(f => `/uploads/${f.filename}`);
+        if (type === 'EXTRA_COST' && receiptUrls.length === 0) {
+            return res.status(400).json({ error: 'Receipts are mandatory for EXTRA_COST' });
+        }
+
+        const charge = {
+          applicationId: new ObjectId(id),
+          workerId: String(workerId),
+          amount: Number(amount) || 0,
+          type: String(type || 'TIP'),
+          description: String(description || ''),
+          receiptUrls,
+          status: 'PENDING',
+          createdAt: new Date()
+        };
+
+        const result = await additionalChargesCollection.insertOne(charge);
+        res.status(201).json({ _id: result.insertedId, ...charge });
+      } catch (err) {
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    app.post('/api/applications/:id/additional-charges/approve', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { chargeId, status } = req.body; // status: APPROVED or REJECTED
+        if (!ObjectId.isValid(id) || !ObjectId.isValid(chargeId)) return res.status(400).json({ error: 'Invalid ids' });
+        
+        const validStatus = ['APPROVED', 'REJECTED'].includes(status) ? status : 'REJECTED';
+        const result = await additionalChargesCollection.updateOne(
+          { _id: new ObjectId(chargeId), applicationId: new ObjectId(id) },
+          { $set: { status: validStatus, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Charge not found' });
+        res.json({ ok: true, status: validStatus });
+      } catch (err) {
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    app.get('/api/applications/:id/additional-charges', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
+        const list = await additionalChargesCollection.find({ applicationId: new ObjectId(id) }).toArray();
+        res.json(list);
+      } catch (err) {
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    app.post('/api/dues/pay', async (req, res) => {
+      try {
+        const { workerId, amount, gateway, transactionId } = req.body;
+        if (!workerId || !amount || !transactionId) return res.status(400).json({ error: 'Missing fields' });
+        
+        const doc = {
+          workerId: String(workerId),
+          amount: Number(amount),
+          gateway: String(gateway || 'manual'),
+          transactionId: String(transactionId),
+          status: 'PENDING_VERIFICATION',
+          isDuePayment: true,
+          createdAt: new Date()
+        };
+        const result = await paymentRequestsCollection.insertOne(doc);
+        res.status(201).json({ _id: result.insertedId, ...doc });
+      } catch (err) {
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    // -------- SSLCommerz Integration --------
+    const STORE_ID = process.env.STORE_ID || 'testbox';
+    const STORE_PASSWD = process.env.STORE_PASSWD || 'testpass';
+    const IS_LIVE = process.env.IS_LIVE === 'true'; // false for sandbox
+
+    app.post('/api/dues/ssl-init', async (req, res) => {
+      try {
+        const { workerId, amount, redirectUrl } = req.body;
+        if (!workerId || !amount) return res.status(400).json({ error: 'Worker ID and amount required' });
+
+        const tran_id = new ObjectId().toString(); // Generate unique transaction ID
+        
+        // Save pending payment request BEFORE jumping to gateway
+        const doc = {
+          _id: new ObjectId(tran_id),
+          workerId: String(workerId),
+          amount: Number(amount),
+          gateway: 'sslcommerz',
+          transactionId: tran_id,
+          status: 'PENDING_GATEWAY',
+          isDuePayment: true,
+          frontendUrl: redirectUrl || 'http://localhost:5173', // Store where to send them back
+          createdAt: new Date()
+        };
+        await paymentRequestsCollection.insertOne(doc);
+
+        const init_url = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/dues`;
+        
+        const data = {
+            total_amount: amount,
+            currency: 'BDT',
+            tran_id: tran_id, // use unique tran_id for each api call
+            success_url: `${init_url}/ssl-success?tran_id=${tran_id}`,
+            fail_url: `${init_url}/ssl-fail?tran_id=${tran_id}`,
+            cancel_url: `${init_url}/ssl-cancel?tran_id=${tran_id}`,
+            ipn_url: `${init_url}/ssl-ipn`,
+            shipping_method: 'No',
+            product_name: 'Platform Dues',
+            product_category: 'Service',
+            product_profile: 'general',
+            cus_name: 'HireMistri Worker',
+            cus_email: 'worker@hiremistri.com',
+            cus_add1: 'Dhaka',
+            cus_add2: 'Dhaka',
+            cus_city: 'Dhaka',
+            cus_state: 'Dhaka',
+            cus_postcode: '1000',
+            cus_country: 'Bangladesh',
+            cus_phone: '01700000000',
+            cus_fax: '01700000000',
+            ship_name: 'HireMistri',
+            ship_add1: 'Dhaka',
+            ship_add2: 'Dhaka',
+            ship_city: 'Dhaka',
+            ship_state: 'Dhaka',
+            ship_postcode: 1000,
+            ship_country: 'Bangladesh',
+        };
+
+        const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWD, IS_LIVE);
+        const apiResponse = await sslcz.init(data);
+        
+        if (apiResponse?.GatewayPageURL) {
+          res.json({ url: apiResponse.GatewayPageURL });
+        } else {
+          res.status(400).json({ error: 'Failed to initialize SSLCommerz session' });
+        }
+      } catch (err) {
+        console.error('SSL init error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    app.post('/api/dues/ssl-success', async (req, res) => {
+      try {
+        const { tran_id } = req.query;
+        
+        const payment = await paymentRequestsCollection.findOne({ _id: new ObjectId(tran_id) });
+        if (!payment || payment.status !== 'PENDING_GATEWAY') {
+            return res.redirect(`${payment?.frontendUrl || 'http://localhost:5173'}/payment-status?status=fail`);
+        }
+
+        // Mark payment as verified
+        await paymentRequestsCollection.updateOne(
+          { _id: new ObjectId(tran_id) },
+          { $set: { status: 'VERIFIED', updatedAt: new Date() } }
+        );
+
+        // BUG FIX #1: Use Firebase UID (uid) not MongoDB _id to find worker
+        const updatedWorker = await usersCollection.findOneAndUpdate(
+          { uid: String(payment.workerId) },
+          { $inc: { dueBalance: -payment.amount } },
+          { returnDocument: 'after' }
+        );
+
+        // BUG FIX #2: Clear isApplyBlocked if balance is now below threshold
+        const newBalance = updatedWorker?.dueBalance ?? 0;
+        if (newBalance < 200) {
+          await usersCollection.updateOne(
+            { uid: String(payment.workerId) },
+            { $set: { isApplyBlocked: false, blockReason: null }, $unset: { dueWarningNotifiedAt: '' } }
+          );
+        }
+
+        // BUG FIX #3: Store workerId as Firebase UID consistently in ledger
+        await ledgersCollection.insertOne({
+          workerId: String(payment.workerId), // Firebase UID
+          type: 'DUE_PAYMENT_CREDIT',
+          direction: 'CREDIT',
+          amount: payment.amount,
+          transactionId: payment.transactionId,
+          createdAt: new Date()
+        });
+
+        res.redirect(`${payment.frontendUrl}/payment-status?status=success&amount=${payment.amount}`);
+      } catch (err) {
+        console.error('SSL success error:', err);
+        res.redirect(`http://localhost:5173/payment-status?status=fail`);
+      }
+    });
+
+    app.post('/api/dues/ssl-fail', async (req, res) => {
+      try {
+        const { tran_id } = req.query;
+        // BUG FIX #4: New MongoDB driver returns doc directly, not .value
+        const payment = await paymentRequestsCollection.findOneAndUpdate(
+          { _id: new ObjectId(tran_id) },
+          { $set: { status: 'FAILED' } },
+          { returnDocument: 'before' }
+        );
+        res.redirect(`${payment?.frontendUrl || 'http://localhost:5173'}/payment-status?status=fail`);
+      } catch (err) {
+        res.redirect(`http://localhost:5173/payment-status?status=fail`);
+      }
+    });
+
+    app.post('/api/dues/ssl-cancel', async (req, res) => {
+      try {
+        const { tran_id } = req.query;
+        // BUG FIX #4: New MongoDB driver returns doc directly, not .value 
+        const payment = await paymentRequestsCollection.findOneAndUpdate(
+          { _id: new ObjectId(tran_id) },
+          { $set: { status: 'CANCELLED' } },
+          { returnDocument: 'before' }
+        );
+        res.redirect(`${payment?.frontendUrl || 'http://localhost:5173'}/payment-status?status=cancel`);
+      } catch (err) {
+        res.redirect(`http://localhost:5173/payment-status?status=cancel`);
+      }
+    });
+
+    app.post('/api/dues/ssl-ipn', async (req, res) => {
+      // IPN listener for silent backend updates
+      res.status(200).send('IPN Received');
+    });
+
+    app.post('/api/dues/verify', authenticateAdmin, async (req, res) => {
+      try {
+        const { paymentRequestId, workerId, amount } = req.body;
+        if (!ObjectId.isValid(paymentRequestId)) return res.status(400).json({ error: 'Invalid id' });
+        
+        // Mark request as approved
+        await paymentRequestsCollection.updateOne(
+          { _id: new ObjectId(paymentRequestId) },
+          { $set: { status: 'APPROVED', updatedAt: new Date() } }
+        );
+
+        // Record in ledger
+        const ledgerEntry = {
+          transactionId: new ObjectId().toString(),
+          workerId: String(workerId),
+          orderId: null,
+          type: 'due_payment_credit',
+          amount: Number(amount),
+          direction: 'CREDIT',
+          createdAt: new Date()
+        };
+        await ledgersCollection.insertOne(ledgerEntry);
+
+        // Update worker due balance
+        const workerUpdate = await usersCollection.findOneAndUpdate(
+          { uid: String(workerId) },
+          { $inc: { dueBalance: -Number(amount) } },
+          { returnDocument: 'after' }
+        );
+
+        if (workerUpdate && workerUpdate.dueBalance < 200) {
+            await usersCollection.updateOne(
+                { uid: String(workerId) },
+                { $set: { isApplyBlocked: false, blockReason: null }, $unset: { dueWarningNotifiedAt: "" } }
+            );
+        }
+
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
+    app.get('/api/wallet/ledger/:uid', async (req, res) => {
+      try {
+        const uid = String(req.params.uid);
+        const list = await ledgersCollection.find({ workerId: uid }).sort({ createdAt: -1 }).toArray();
+        const worker = await usersCollection.findOne({ uid });
+        
+        res.json({
+            ledgers: list,
+            dueBalance: worker ? (worker.dueBalance || 0) : 0,
+            isApplyBlocked: worker ? !!worker.isApplyBlocked : false
+        });
+      } catch (err) {
+        res.status(500).json({ error: 'Failed' });
+      }
+    });
+
     // ---------- error handlers (must be after routes) ----------
 
     // 404 handler
@@ -6644,8 +7991,8 @@ async function startServer() {
 
     // ---------- Routes end ----------
 
-    // Schedule job expiration task (runs daily at midnight)
-    cron.schedule('0 0 * * *', async () => {
+    // Schedule job expiration task (runs hourly)
+    cron.schedule('0 * * * *', async () => {
       try {
         console.log('🕐 Running scheduled job expiration task...');
         const now = new Date();
@@ -6661,8 +8008,8 @@ async function startServer() {
           console.log(`📅 Found ${expiredJobs.length} expired job(s) to close`);
           
           for (const job of expiredJobs) {
-            // Update job status; for private job offers set offerStatus to expired
-            const updateFields = { status: 'completed', updatedAt: new Date() };
+            // Update job status to 'expired'
+            const updateFields = { status: 'expired', updatedAt: new Date() };
             if (job.isPrivate && job.offerStatus === 'pending') {
               updateFields.offerStatus = 'expired';
             }
@@ -6702,7 +8049,7 @@ async function startServer() {
                     clientUser.email,
                     clientUser.displayName || 'Client',
                     job.title || 'Your Job',
-                    'completed',
+                    'expired',
                     'expired'
                   );
                 }
@@ -6747,6 +8094,18 @@ async function startServer() {
         } else {
           console.log('✅ No expired jobs found');
         }
+
+        // Run Due Monitor script
+        console.log('🕐 Running Due Monitor...');
+        const { exec } = require('child_process');
+        exec('node scripts/dueMonitor.js', (error, stdout, stderr) => {
+            if (error) {
+                console.error('❌ Due Monitor execution failed:', error);
+            } else {
+                console.log('✅ Due Monitor stdout:', stdout);
+            }
+        });
+
       } catch (err) {
         console.error('❌ Error in job expiration task:', err);
       }
@@ -6755,7 +8114,7 @@ async function startServer() {
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on http://localhost:${PORT}`);
       console.log(`⚡ WebSocket server running on ws://localhost:${PORT}`);
-      console.log(`⏰ Job expiration task scheduled (runs daily at midnight)`);
+      console.log(`⏰ Scheduled tasks (job expiration, due monitor) running daily at midnight`);
     });
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err);

@@ -178,6 +178,68 @@ async function sendJobOfferExpiredEmail(workerEmail, workerName, jobTitle) {
   return await sendEmail(workerEmail, subject, html);
 }
 
+/**
+ * Send worker registration approved email
+ */
+async function sendWorkerRegistrationApprovedEmail(workerEmail, workerName) {
+  const subject = '🎉 Your Hire Mistri Worker Account is Approved!';
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #f9fafb; padding: 32px; border-radius: 12px;">
+      <div style="text-align: center; margin-bottom: 24px;">
+        <h1 style="color: #1DC66C; font-size: 28px; margin: 0;">✅ Account Approved!</h1>
+      </div>
+      <p style="color: #374151; font-size: 16px;">Hello <strong>${workerName}</strong>,</p>
+      <p style="color: #374151; font-size: 16px;">
+        Congratulations! Your Hire Mistri worker account has been reviewed and <strong>approved</strong>.
+        You can now log in and start applying for jobs on the platform.
+      </p>
+      <div style="text-align: center; margin: 32px 0;">
+        <a href="${process.env.WORKER_APP_URL || 'http://localhost:5174'}/login"
+           style="background: #1DC66C; color: white; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px;">
+          Login & Start Working →
+        </a>
+      </div>
+      <p style="color: #6B7280; font-size: 14px;">
+        If you have any questions, you can contact our support team at any time.
+      </p>
+      <p style="color: #9CA3AF; font-size: 12px; margin-top: 32px;">This is an automated notification from Hire Mistri.</p>
+    </div>
+  `;
+  return await sendEmail(workerEmail, subject, html);
+}
+
+/**
+ * Send worker registration rejected email
+ */
+async function sendWorkerRegistrationRejectedEmail(workerEmail, workerName, rejectionReason = '') {
+  const subject = 'Update on Your Hire Mistri Worker Registration';
+  const reasonBlock = rejectionReason
+    ? `<div style="background: #FEF3C7; border-left: 4px solid #F59E0B; padding: 16px; margin: 16px 0; border-radius: 4px;">
+         <p style="color: #92400E; margin: 0; font-size: 14px;"><strong>Reason:</strong> ${rejectionReason}</p>
+       </div>`
+    : '';
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #f9fafb; padding: 32px; border-radius: 12px;">
+      <div style="text-align: center; margin-bottom: 24px;">
+        <h1 style="color: #EF4444; font-size: 28px; margin: 0;">Registration Update</h1>
+      </div>
+      <p style="color: #374151; font-size: 16px;">Hello <strong>${workerName}</strong>,</p>
+      <p style="color: #374151; font-size: 16px;">
+        Thank you for applying to be a worker on Hire Mistri. After reviewing your registration,
+        we were unable to approve your account at this time.
+      </p>
+      ${reasonBlock}
+      <p style="color: #374151; font-size: 16px;">
+        If you believe this is an error or would like to provide additional information,
+        please contact our support team. You may also re-submit your registration with corrected documents.
+      </p>
+      <p style="color: #6B7280; font-size: 14px;">We appreciate your interest in Hire Mistri.</p>
+      <p style="color: #9CA3AF; font-size: 12px; margin-top: 32px;">This is an automated notification from Hire Mistri.</p>
+    </div>
+  `;
+  return await sendEmail(workerEmail, subject, html);
+}
+
 module.exports = {
   sendEmail,
   sendApplicationReceivedEmail,
@@ -187,5 +249,7 @@ module.exports = {
   sendJobOfferEmail,
   sendJobOfferReminderEmail,
   sendJobOfferExpiredEmail,
+  sendWorkerRegistrationApprovedEmail,
+  sendWorkerRegistrationRejectedEmail,
 };
 
