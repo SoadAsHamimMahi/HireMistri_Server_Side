@@ -73,6 +73,13 @@ async function startServer() {
     app.use('/api', browseRouter);
     // Jobs (includes /api/browse-jobs, /api/jobs, /api/job-offers, /api/job-applications, /api/my-applications, /api/client-applications, /api/worker-job-requests, /api/services, /api/reviews, /health)
     app.use('/api', jobsRouter);
+// ---------------------------------------------------
+// Health‑check endpoint – used by Netlify, CI, and us to verify the API is alive
+app.get('/health', (req, res) => {
+  // You can add extra info later, e.g. version, uptime, DB status, etc.
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+// ---------------------------------------------------
     app.use('/api/applications', applicationsRouter);
     app.use('/api/messages', messagesRouter);
     app.use('/api/notifications', notificationsRouter);
