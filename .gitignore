@@ -24,3 +24,6 @@ Thumbs.db
 # 🔄 Output or build artifacts (if ever added)
 dist/
 build/
+
+# 📁 Uploaded files (now stored on Cloudinary, not committed to git)
+uploads/

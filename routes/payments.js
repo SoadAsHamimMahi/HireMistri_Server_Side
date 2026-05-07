@@ -60,7 +60,7 @@ router.post('/applications/:id/additional-charges', upload.array('receipts', 5),
     const { workerId, amount, type, description } = req.body;
     const files = req.files || [];
     if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' });
-    const receiptUrls = files.map(f => `/uploads/${f.filename}`);
+    const receiptUrls = files.map(f => f.path); // Cloudinary CDN URLs
     if (type === 'EXTRA_COST' && receiptUrls.length === 0) return res.status(400).json({ error: 'Receipts are mandatory for EXTRA_COST' });
     const charge = { applicationId: new ObjectId(id), workerId: String(workerId), amount: Number(amount) || 0, type: String(type || 'TIP'), description: String(description || ''), receiptUrls, status: 'PENDING', createdAt: new Date() };
     const result = await collections.additionalCharges.insertOne(charge);

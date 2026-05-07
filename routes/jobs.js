@@ -136,8 +136,7 @@ router.post('/browse-jobs', async (req, res) => {
 
 router.post('/browse-jobs/upload', upload.array('images', 10), (req, res) => {
   if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
-  const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ imageUrls: req.files.map((file) => `${base}/uploads/${file.filename}`) });
+  res.json({ imageUrls: req.files.map((file) => file.path) }); // Cloudinary CDN URLs
 });
 
 router.patch('/browse-jobs/:id', async (req, res) => {

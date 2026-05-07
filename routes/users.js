@@ -188,7 +188,7 @@ router.post('/:uid/avatar', upload.single('avatar'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const uid = String(req.params.uid);
-    const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+    const publicUrl = req.file.path; // Cloudinary CDN URL
     await collections.users.updateOne({ uid }, { $set: { profileCover: publicUrl, updatedAt: new Date() }, $setOnInsert: { uid, createdAt: new Date() } }, { upsert: true });
     res.json({ url: publicUrl });
   } catch (e) {
@@ -205,7 +205,7 @@ async function handleNidUpload(side, req, res) {
       if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
       const uid = String(req.params.uid);
       if (req.user && req.user.uid !== uid) return res.status(403).json({ error: 'Unauthorized' });
-      const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+      const publicUrl = req.file.path; // Cloudinary CDN URL
       const fieldMap = { front: 'nidFrontImageUrl', back: 'nidBackImageUrl', emergencyFront: 'emergencyContactNidFrontUrl', emergencyBack: 'emergencyContactNidBackUrl' };
       const field = fieldMap[side] || 'emergencyContactNidImageUrl';
       await collections.users.updateOne({ uid }, { $set: { [field]: publicUrl, updatedAt: new Date() }, $setOnInsert: { uid, createdAt: new Date() } }, { upsert: true });

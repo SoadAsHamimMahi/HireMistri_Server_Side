@@ -1,24 +1,44 @@
-// middleware/upload.js — Multer file storage configuration
+// middleware/upload.js — Cloudinary-based file storage (replaces local disk storage)
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 
-const uploadsDir = path.join(__dirname, '..', 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir);
-  console.log('📂 Created uploads folder automatically');
-}
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+// ── Configure Cloudinary SDK from environment variables ───────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// ── General storage: profile photos, job images, payment receipts ─────────────
+// resource_type: 'auto' means Cloudinary auto-detects image vs video
+const storage = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder:           'hiremistri/uploads',
+    allowed_formats:  ['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4', 'mov', 'avi'],
+    resource_type:    'auto',
+    transformation:   [{ quality: 'auto', fetch_format: 'auto' }],
+  },
+});
+
+// ── NID / Identity-document storage: images only, 5 MB cap ───────────────────
+const nidStorage = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder:          'hiremistri/nids',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
+    resource_type:   'image',
+    transformation:  [{ quality: 80 }],
+  },
+});
+
+// ── Multer instances ──────────────────────────────────────────────────────────
 const upload = multer({ storage });
 
-// NID document upload middleware (image files only, 5MB max)
+// nidUploadMiddleware — same name exported as before, so routes/users.js needs no import change
 const nidUploadMiddleware = multer({
-  storage,
+  storage: nidStorage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp'];
@@ -30,4 +50,4 @@ const nidUploadMiddleware = multer({
   },
 }).single('file');
 
-module.exports = { upload, uploadsDir, nidUploadMiddleware };
+module.exports = { upload, nidUploadMiddleware };
